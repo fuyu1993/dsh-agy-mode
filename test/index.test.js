@@ -958,7 +958,12 @@ function makeMountCtx({ settings, subprocess, provided = new Map() } = {}) {
       provide(name, value) {
         if (services.has(name)) throw new Error(`service "${name}" has been registered already`)
         services.set(name, value)
-        return () => services.delete(name)
+        // Cordis registers the provider's disposer with the fiber, so unloading
+        // the row removes the service. The stub does the same, or a test could
+        // believe a service was removed when nothing ever removed it.
+        const dispose = () => services.delete(name)
+        cleanups.push(dispose)
+        return dispose
       },
       set(name, value) {
         if (!services.has(name)) throw new Error(`cannot set property "${name}" without provide`)
@@ -1071,7 +1076,22 @@ test('unloading the configuration row removes the reader', async () => {
   const { ctx, services, cleanups } = makeMountCtx()
   mountConfig(ctx, {}, { reader: () => ({}), schedule: () => 0, repeat: () => 0, cancel: () => {} })
   assert.equal(services.has(DEFAULTS_SERVICE), true)
-  // The provider's own disposer is what Cordis runs on unload; the mount also
-  // registers cleanup for its timers, which must not throw.
+  // Cordis runs every effect's disposer on unload, the provider's included.
+  // After that the preset row must find no service rather than a stale reader.
   for (const cleanup of cleanups) cleanup()
+  assert.equal(services.has(DEFAULTS_SERVICE), false)
+})
+
+test('the configuration row supplies a reader even when the caller passes none', async () => {
+  const { mountConfig, DEFAULTS_SERVICE } = await import('../config-runtime.js')
+  const { ctx, services } = makeMountCtx()
+  // No `reader` option, and a config shaped like the row's volatile fields.
+  mountConfig(ctx, { planModel: 'only-model', planEffort: 'medium' }, {
+    schedule: () => 0,
+    repeat: () => 0,
+    cancel: () => {},
+  })
+  const reader = services.get(DEFAULTS_SERVICE)
+  assert.equal(typeof reader, 'function', 'a missing reader must not register undefined')
+  assert.deepEqual(reader('plan'), { present: true, model: 'only-model', effort: 'medium' })
 })

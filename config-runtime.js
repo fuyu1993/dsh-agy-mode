@@ -13,7 +13,7 @@
  * @module dsh-agy-mode/config-runtime
  */
 
-import { parseModelCatalog, unwrap } from './config-model.js'
+import { createReader, parseModelCatalog, unwrap } from './config-model.js'
 
 /** Profile entry id; also the settings namespace the page reads. */
 export const ENTRY_ID = 'agy-planner-config'
@@ -164,8 +164,10 @@ export function mountConfig(ctx, config = {}, options = {}) {
   }
 
   // Resolve the service before any probe can run, so a reader is available even
-  // if the CLI is missing.
-  ctx.provide(DEFAULTS_SERVICE, options.reader)
+  // if the CLI is missing. A caller that supplies no reader still gets the
+  // config-derived one: registering `undefined` would leave the preset row
+  // calling `undefined(name)` on every agy tool.
+  ctx.provide(DEFAULTS_SERVICE, options.reader ?? createReader(config))
 
   // One probe per mount, so the first visit to the page already has a catalog.
   // The settings service answers only after the Loader settles, so the first

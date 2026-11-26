@@ -13,7 +13,7 @@ Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/
 - `collectDiff` inclusion of untracked text files, binary skipping, and `baseHead..HEAD` mid-task commit diffs.
 - `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
 
-26 tests in total as of 0.4.1.
+27 tests in total as of 0.4.2.
 
 ### 0.4.1
 
@@ -30,6 +30,19 @@ Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/
 - Four tests now cover it. Their stub enforces the real contract — `set` throws
   unless the name was provided — and reverting the fix to `ctx.set` reproduces
   the exact production error in four tests, so the rule cannot silently regress.
+
+### 0.4.2
+
+- `mountConfig` registered `options.reader` unconditionally, so a caller that
+  passed none got a `undefined` service and the preset row would call
+  `undefined(tier)` on every agy tool. It now falls back to `createReader(config)`,
+  and a test mounts without a reader and reads a tier back.
+- The unload test asserted the service existed but never that unloading removed
+  it: the stub's `provide` returned a disposer without registering it, so the
+  cleanup loop could not delete anything. The stub now registers the provider's
+  disposer the way Cordis does, and the test asserts the service is gone
+  afterwards.
+- 27 tests. Reverting the `provide` call still turns five of them red.
 
 ### 0.4.0
 
