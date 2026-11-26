@@ -36,3 +36,12 @@ Desktop, profile `desktop`, `agy` 1.5.17).
   review with agy): that needs a new session created with this mode selected.
 - `agy` was signed in on this machine. A signed-out CLI is reported as advice
   rather than an empty answer, but that path was not exercised end to end.
+
+## After publishing
+
+The published package is named `dsh-agy-mode` (it was `@local/dsh-agy-mode`
+while it only lived in this profile), so the composable row now reads
+`name: dsh-agy-mode`. The plugin code is unchanged; the stub-host harness was
+re-run after the rename and behaves identically. Re-installing this profile's
+entry from the repository is required for the local link to carry the new
+name.
