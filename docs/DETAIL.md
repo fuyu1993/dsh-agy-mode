@@ -91,6 +91,62 @@ requirement never covered is a minor note rather than a blocker. Measured
 effect: the same piece of deliberately loose code went from `fail` (major) to
 `pass` (minor) after this constraint was added.
 
+### The gate stays shut on a failure
+
+A review that fails is unfinished work, not a cleared gate. The gate opens only
+on a `pass`; until then a closing turn is steered back with the outstanding
+findings named. A `fail` with no findings locks it too, treated as one major.
+
+After `maxReviewRounds` consecutive failures the mode stops steering and asks
+for the disagreement to be reported to the user, so a stuck loop costs three
+calls rather than unbounded ones.
+
+### Diff first
+
+By default the plugin collects the change itself — `git diff HEAD` plus the
+porcelain file list — and puts it in the prompt. The author's description is
+included when given, but it is not the subject of review: the diff is.
+
+The measurement behind this: the same change reviewed with the diff in the
+prompt cost 10913 tokens; letting agy rediscover it cost 10807 tokens and
+finished in one turn without reading a file. Equal cost, unverifiable answer.
+`scope: "repo"` opts back into exploration for changes that need cross-file
+tracking.
+
+## Cost
+
+Three tiers, because one effort for every call is either wasteful or shallow:
+
+| Tier | Used by | Default |
+|---|---|---|
+| `plan` | `agy_consult` (default mode) | `gemini-4-hydrogen` / `high` |
+| `consult` | `agy_consult` with `mode: quick` | `gemini-3.8-flash` / `low` |
+| `review` | `agy_review` | `gemini-4-hydrogen` / `high` |
+
+Two facts drive the design. An `agy` call has a fixed cost of about 10.8k input
+tokens whatever it is asked, so the lever is *how many calls* and *what tier*,
+not prompt wording. And `agy` can resume a conversation (`--conversation`), so
+a follow-up need not re-explore the repository.
+
+Conversations are keyed by the task root and shared across tiers: a plan, a
+lookup and a review all concern the same checkout, and splitting them would
+make agy re-read what it already read. A conversation is dropped when the
+directory changes, when it exceeds `maxConversationTurns`, or when the CLI
+cannot resume it (in which case the call is retried cold rather than failing).
+
+Spend is accumulated per task and reported as
+`agy so far: N call(s), X in (Y% cached), Z out`. `cache_read_tokens` is a
+subset of `input_tokens` in agy's accounting (`total = input + output`), so the
+two are never added.
+
+### Model ids carry their own effort
+
+`agy` model ids end in their effort (`gemini-4-hydrogen-high`), and passing
+`--effort` alongside one is rejected as a conflict. So a suffixed id wins and
+the effort argument is dropped; an unsuffixed id (a family name, an
+orchestrator) takes the effort. A tier that must vary its effort therefore has
+to use an unsuffixed id.
+
 ## Requirements and limits
 
 - `agy` must be installed and signed in; a signed-out CLI reports only on

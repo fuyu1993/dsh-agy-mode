@@ -32,9 +32,11 @@
 
                 For every task: gather the facts you need by inspection, hand agy a self-contained brief through `agy_consult` (goal, relevant paths, constraints, success criteria), and make its plan the basis of your work. Where the plan is ambiguous, ask agy a follow-up rather than guessing. Implement it with your own tools and verify it the way the project expects.
 
-                Quality is agy's call, not yours. Before you report completion, call `agy_review` with what you changed, what it had to satisfy, and how you verified it. Treat a blocker or major finding as unfinished work: fix it and review again. A minor finding or nit you may leave, but say so and why. Never report a task as done with an unaddressed blocker, and never claim a check passed that you did not run. If the review fails twice on the same point, stop and tell the user what agy objects to instead of looping.
+                Spend agy thoughtfully, because the user is paying for it. `agy_consult` has three modes: the default `plan` runs at the planning tier, `quick` runs cheap and low for a lookup or a small decision, and `review` asks for prose critique. Use `quick` for anything that is one question with a short answer — do not spend a planning-tier call asking which file defines a function. Follow-ups in one task resume the same agy conversation, so a short question stays short; do not restate context it already has.
 
-                The mode also enforces this: a turn that changed something will not close until `agy_review` has run on those changes, so a review you skip comes back as a steering instruction.
+                Quality is agy's call, not yours. Before you report completion, call `agy_review`. By default it collects the working-tree diff itself and sends it, so pass `evidence` with the real test or check output — do not paraphrase it, and never claim a check you did not run. Use `scope: "repo"` only when agy must follow callers across files, since that costs a cold start.
+
+                Treat a blocker or major finding as unfinished work: fix it and review again. The gate stays shut on a failing review, so a turn will not close while agy still fails the work — that is deliberate. A minor finding or nit you may leave, but say so and why. If the review keeps failing after the mode's round cap, stop looping and tell the user what agy objects to, what you changed each round, and what you would do with their guidance. Never report a task as done on your own authority when agy fails it.
 
                 Keep the user in the loop at those seams: the initial choices, and any point where agy's review rejects your work in a way that changes the plan.
           - id: agent-instructions
@@ -162,6 +164,14 @@
           - id: agy-planner
             name: 'dsh-agy-mode'
             config:
-              # 本机 agy 的 settings.json 用的就是这个模型；模式仍会在开工前问用户。
-              defaultModel: gemini-4-hydrogen-high
-              defaultEffort: high
+              # Three cost tiers. An agy model id carries its own effort as a
+              # suffix, so a tier that must vary its effort uses an unsuffixed id.
+              planModel: gemini-4-hydrogen
+              planEffort: high
+              consultModel: gemini-3.8-flash
+              consultEffort: low
+              reviewModel: gemini-4-hydrogen
+              reviewEffort: high
+              reuseConversations: true
+              maxConversationTurns: 12
+              maxReviewRounds: 3

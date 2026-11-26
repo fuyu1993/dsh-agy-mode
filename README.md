@@ -8,14 +8,14 @@
 
 | 工具 | 作用 |
 |---|---|
-| `agy_consult` | 让 `agy` 只读地跑一轮：`mode: plan` 出实现方案，`mode: review` 出文字批评。 |
-| `agy_review` | 质量闸门：agy 看仓库，返回结构化 `verdict` 和 findings（blocker / major / minor / nit）。 |
+| `agy_consult` | 让 `agy` 只读地跑一轮：`mode: plan` 出实现方案（规划档），`mode: quick` 便宜快答，`mode: review` 出文字批评。 |
+| `agy_review` | 质量闸门：默认自己收集工作区 diff 直送 agy，返回结构化 `verdict` 和 findings（blocker / major / minor / nit）。 |
 | `agy_models` | 列出本机 `agy` 认的模型 id 与思考强度档位。 |
 | `agy_delegation_budget` | 记录你关于子任务的决定：开不开、同时几个、递归几层。没记录前，`subagent` / `subagent_fork` / `workflow` 一律被拦。 |
 
 两道强制：
 
-1. **质量闸门**（`agy_review`）—— 改过东西的回合不能直接结束，没有审核就收尾会被塞一条指令要求先审。
+1. **质量闸门**（`agy_review`）—— 改过东西的回合不能直接结束，没有审核就收尾会被塞一条指令要求先审；agy 判 fail 之后闸门不打开，除非后续审核通过。
 2. **子任务预算**（`agy_delegation_budget`）—— 派活前实时按存活子任务数与调用者深度校验。
 
 ```
@@ -95,11 +95,21 @@ dsh plugin --profile <profile> add /绝对路径/dsh-agy-mode
 |---|---|---|
 | `command` | `agy` | 可执行文件。裸名走 PATH，绝对路径会被校验。 |
 | `timeoutSeconds` | `900` | 单次咨询的 `--print-timeout`。0 表示不设限。 |
-| `defaultModel` | `gemini-4-hydrogen-high` | 调用没指定模型时用哪个。 |
-| `defaultEffort` | `high` | 调用没指定强度时用哪个；可选 `low`/`medium`/`high`/`xhigh`/`max`。 |
+| `planModel` / `planEffort` | `gemini-4-hydrogen` / `high` | 规划档：出方案时用。 |
+| `consultModel` / `consultEffort` | `gemini-3.8-flash` / `low` | 快问档：`mode: quick` 用。 |
+| `reviewModel` / `reviewEffort` | `gemini-4-hydrogen` / `high` | 审核档：`agy_review` 用。 |
+| `reuseConversations` | `true` | 同一任务内续接 agy 会话，不重复冷启动。 |
+| `maxConversationTurns` | `12` | 会话累积到这么多轮就换新的（太长反而更贵）。 |
+| `maxReviewRounds` | `3` | 连续审核失败几次后停下，不再自动重试。 |
+| `diffMaxChars` | `48000` | 送审 diff 的长度上限。 |
+| `retries` | `1` | 网关/限流这类瞬时失败的重试次数。 |
 | `requireReview` | `true` | 改成 `false` 关掉「改了东西就必须审核」的收尾拦截（`agy_review` 工具仍在）。 |
 
-默认值只影响「没指定时」和「问的时候的推荐项」，模式本身仍会在开工前问你。
+`defaultModel` / `defaultEffort` 仍可设置，作为三档里没单独配的那档的兜底。
+
+**模型 id 自带强度**：agy 的模型名带后缀（`gemini-4-hydrogen-high`），此时再传 `--effort` 会被 agy 判为冲突并报错。插件会自动处理 —— 带后缀的 id 优先，不再额外传 effort；要让某一档真正换强度，就用不带后缀的 id（如 `gemini-4-hydrogen`）。
+
+三档只影响默认值，模式本身仍会在开工前问你。
 
 ## 质量闸门怎么判定
 
@@ -111,11 +121,30 @@ dsh plugin --profile <profile> add /绝对路径/dsh-agy-mode
 
 判定规则由插件决定，不交给模型自觉：
 
-- 有任何 **blocker** 或 **major** → `fail`，且收尾拦截会要求先处理。
+- 有任何 **blocker** 或 **major** → `fail`，闸门保持关闭。
 - 只有 minor / nit → `pass with notes`，可以交付，但要在汇报里说清。
 - 审核提示词限定「按需求原文判，不按你想要的设计判」；需求没规定的场景只算 uncovered，不能当 blocker —— 实测中这条把「`total('2',3)` 返回 `'23'`」从 major 降到了 minor。
 
 agy 若没返回结构化结果，插件**报错而不是猜**：拿不到判定就不假装通过了。
+
+### 审了但没修，不算过关
+
+闸门只认「**pass**」，不认「审过一次」。上一版有个漏洞：agy 判 fail 之后 DSH 直接收尾，插件并不知道问题没解决。
+
+现在的行为：
+
+- fail 之后闸门**不打开**，收尾会再拦一次，并点名还挂着哪几条 finding。
+- 续审时把上一轮的 findings 一起发给 agy，让它只复核这些点，而不是把整个任务重审一遍。
+- 连续失败到 `maxReviewRounds`（默认 3）就**停止自动重试**，改为要求 DSH 如实汇报分歧，交给你判断 —— 防止「改不对→再审→还不对」的烧钱循环。
+- fail 但 agy 一条 finding 都没给，也照样锁住闸门（按一条 major 处理）。
+
+### 默认送 diff，不让 agy 自己重读
+
+`agy_review` 默认 `scope: "diff"`：插件自己跑 `git diff HEAD` 收集改动（含未提交），连同改动文件列表一起塞进提示词。
+
+这么做的原因：实测同一份改动，把 diff 塞进提示词耗 10.9k token，让 agy 自己探索耗 10.8k —— **钱一样多**，但后者只转 1 轮就回答了，很可能根本没读文件。花同样的钱买到不可靠的结论。
+
+`scope: "repo"` 才让 agy 自己探索仓库，适合需要跨文件追踪调用方的改动，代价是一次冷启动。
 
 ## 开工前的四个问题
 
@@ -133,10 +162,14 @@ agy 若没返回结构化结果，插件**报错而不是猜**：拿不到判定
 - `agy` **看不到这个对话**，所以提示词必须自包含；模糊的简报只会换来模糊的方案。
 - 没登录时 `agy` 的报错只出现在 stderr，插件会把它翻译成「请先登录」而不是回一个空答案。
 - 收尾拦截是「塞一条指令」而非硬失败：你明确说不要审核时，模型可以说明后结束。
+- 续接会话省的是冷启动的钱，但上下文会累积；到 `maxConversationTurns` 会自动换新会话。
+- 同一任务的 plan / quick / review 共用一个 agy 会话（同一个代码库，没必要分开重读）。换目录会自动新开。
+- 网页渲染、浏览器操作这类 agy 自带工具对编程任务没用，但会在每次调用的固定开销里；目前没法裁剪。
 - 审核要花一次 agy 调用的时间与额度；大改动建议一次审完，不要一句一改一审核。
 - 子任务预算按任务记在内存里，**不落盘**：新任务会重新问，这是有意为之。
 - 本模式不改变 profile 的权限策略；沙箱与审批设置仍然决定 DSH 自己能做什么。
 - 每次咨询受 `timeoutSeconds` 与一小时工具超时双重限制。
+- 每次调用的 token 花费会累计并在结果里回报（`agy so far: N call(s), X in (Y% cached), Z out`）。
 
 ## 验证情况
 
