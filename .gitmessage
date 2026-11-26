@@ -1,0 +1,31 @@
+本项目所有 git 提交注释与发布注释一律中英双语。
+All git commit messages and release notes in this repository are bilingual (Chinese and English).
+
+规则 / Rules
+-----------
+1. 提交注释：先中文，空行分隔，再英文。两边说同一件事，不互为梗概。
+   Commit messages: Chinese first, then a blank line, then English. Both say
+   the same thing; neither is a summary of the other.
+
+2. 首行标题：`<type>: <中文标题>` 后接 `/ <English subject>`，总长不超过 100 字符。
+   Subject line: `<type>: <中文标题> / <English subject>`, at most 100 columns.
+
+3. 发布注释（GitHub Release body）：`## 中文` 与 `## English` 两个段落，各自完整，
+   都写明改动、修复与验证方式。
+   Release notes: a `## 中文` section and a `## English` section, each complete,
+   each stating what changed, what was fixed, and how it was verified.
+
+4. 类型 / Types: feat, fix, docs, refactor, test, chore
+
+示例 / Example
+-------------
+fix: 声明配置服务而非赋值未声明名字 0.4.2 / declare the service instead of an undeclared name
+
+0.4.0 用 ctx.set 发布了读者，而 Cordis 只允许赋值已声明的名字，
+插件页因此报 cannot set property "agyModeDefaults" without provide。
+改用 ctx.provide，它声明服务并自带 disposer。
+
+0.4.0 published its reader with ctx.set, but Cordis only lets a fiber assign a
+name it has declared, so the plugin page failed with cannot set property
+"agyModeDefaults" without provide. Uses ctx.provide, which declares the service
+and registers its own disposer.

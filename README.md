@@ -192,3 +192,11 @@ agy 若没返回结构化结果，插件**报错而不是猜**：拿不到判定
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+## 贡献
+
+提交注释与发布注释一律**中英双语**，规则见 [CONTRIBUTING.md](CONTRIBUTING.md)；`git config commit.template .gitmessage` 可启用模板。
+
+Commit messages and release notes are **bilingual** (Chinese and English); see
+[CONTRIBUTING.md](CONTRIBUTING.md), and `git config commit.template .gitmessage`
+to enable the template.
