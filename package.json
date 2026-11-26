@@ -1,6 +1,6 @@
 {
   "name": "dsh-agy-mode",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "type": "module",
   "description": "DSH agent mode where the local Antigravity CLI plans, reviews and signs off on quality while DSH executes. Three cost tiers, conversation reuse, diff-first review, an enforced quality gate, a delegation budget, and model/effort choices set on the plugin page.",
   "license": "MIT",
@@ -20,20 +20,21 @@
     "type": "git",
     "url": "git+https://github.com/fuyu1993/dsh-agy-mode.git"
   },
-  "main": "./index.js",
+  "main": "./config.js",
   "scripts": {
     "test": "node --test"
   },
   "exports": {
-    ".": "./index.js",
+    ".": "./config.js",
+    "./planner": "./index.js",
     "./config": "./config.js",
     "./config-model": "./config-model.js",
+    "./config-runtime": "./config-runtime.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./locale/config/*.json": "./locale/config/*.json",
     "./icon": "./icon.svg",
-    "./package.json": "./package.json",
-    "./config-runtime": "./config-runtime.js"
+    "./package.json": "./package.json"
   },
   "files": [
     "README.md",

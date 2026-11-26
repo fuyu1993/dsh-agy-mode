@@ -185,7 +185,7 @@ place, so it follows whatever the page currently says.
 
 ## Page-editable configuration
 
-`agy-planner-config` is a second mount of this package (`dsh-agy-mode/config`)
+`agy-planner-config` is a second mount of this package (its root entry, `dsh-agy-mode`)
 whose `Config` is all hull and no machinery: it registers no tools and no hooks,
 only publishes a reader on the Host context that the preset-child row resolves
 with `ctx.get('agyModeDefaults')` on every call. The same package is mounted
@@ -196,3 +196,17 @@ Because a volatile field is a stable reference the Loader updates in place, the
 reader unwraps it at call time. Capturing the values in `apply` would freeze
 whatever was there at activation, which is exactly the value the page is meant
 to change.
+
+### Why the root entry is the configuration row
+
+The browser half is discovered per Loader row: `client-modules` narrows a row's
+`name` with `exactPackageSpecifier` and returns nothing for anything containing
+`/` — a subpath, a path or a scheme — so only a row named exactly `dsh-agy-mode`
+contributes this package's `./client` bundle. 0.4.2 had neither such row (its
+rows were `dsh-agy-mode/config` and the preset), which is why the plugin page
+showed the bundle but no configuration card.
+
+So the root export (`dsh-agy-mode`, `config.js`) is the configuration row, and
+the five tools moved to the `dsh-agy-mode/planner` subpath that the preset child
+row mounts. The client bundle is served exactly once, by the Host row, which is
+where the card belongs.

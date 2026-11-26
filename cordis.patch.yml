@@ -15,7 +15,7 @@
 # `plugins` list is not an `include` entry.
 - insert:
     - id: agy-planner-config
-      name: 'dsh-agy-mode/config'
+      name: 'dsh-agy-mode'
       config:
         planModel: gemini-4-hydrogen
         planEffort: high
@@ -183,7 +183,7 @@
             name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: true
           - id: agy-planner
-            name: 'dsh-agy-mode'
+            name: 'dsh-agy-mode/planner'
             config:
               # Model and effort live on the Host `agy-planner-config` row above,
               # where the plugin page can edit them; this row only carries what
