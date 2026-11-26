@@ -2,13 +2,23 @@
  * Antigravity planner mode — host half.
  *
  * Judgement belongs to the local Antigravity CLI (`agy`); execution belongs to
- * DSH. This plugin owns the transport, the review gate, and the delegation
- * budget:
+ * DSH. This plugin owns the transport, the review gate, the route overrides,
+ * and the delegation budget:
  *
  *   agy_consult            one read-only planning or review turn, answer returned
  *   agy_review             structured quality verdict on finished work
  *   agy_models             the model ids and reasoning efforts this `agy` accepts
+ *   agy_routes             the user's per-task agy model and effort overrides
  *   agy_delegation_budget  the user's answer on subagents, concurrency and depth
+ *
+ * Cost matters as much as quality here, so three things are deliberate:
+ *
+ *   - Three effort tiers. Planning is one expensive shot; a mid-task question
+ *     is not. A small question runs on a cheap model at low effort.
+ *   - Conversation reuse. agy can resume a conversation (`--conversation`), so
+ *     a follow-up does not re-explore the repository from cold.
+ *   - Diff first. Sending the working-tree diff costs about the same as letting
+ *     agy rediscover it, but the diff is ground truth instead of a guess.
  *
  * Tools are registered as plain definitions with raw JSON Schemas, so the
  * bundle imports nothing from DSH packages and needs no dependency of its own.
@@ -17,8 +27,9 @@
  */
 
 import { homedir, tmpdir } from 'node:os'
-import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile, stat, unlink } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 
 export const name = 'agy-planner'
 // Required services only; everything else is read through ctx.get() so the
@@ -31,8 +42,23 @@ export const AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 /** Tool names that start delegated work, and so consume the budget. */
 const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 
-/** Tools whose call means the agent changed something worth reviewing. */
-const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'pwsh', 'terminal_send', 'str_replace_editor'])
+/** Direct file-editing tools whose success always marks the task dirty. */
+const FILE_MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor'])
+
+/** Shell/terminal tools that may mutate files (checked via repo fingerprint). */
+const SHELL_TOOLS = new Set(['bash', 'pwsh', 'terminal_send'])
+
+/** Tools whose call means the agent may have changed something worth reviewing. */
+const MUTATING_TOOLS = new Set([...FILE_MUTATING_TOOLS, ...SHELL_TOOLS])
+
+/** Findings at these severities hold a task back; the rest are notes. */
+const BLOCKING = new Set(['blocker', 'major'])
+
+/** Files deprioritized when a large diff must be clipped to fit budget. */
+const LOW_PRIORITY_DIFF_RE = /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|Gemfile\.lock|composer\.lock|go\.sum)$|\.(?:min\.js|min\.css|map|snap)$/i
+
+/** Maximum tracked task roots per in-memory map to bound long-running processes. */
+const MAX_TRACKED_ROOTS = 200
 
 /** Schema agy fills for one review, so the verdict is machine-readable. */
 const REVIEW_SCHEMA = {
@@ -65,17 +91,64 @@ const REVIEW_SCHEMA = {
   required: ['verdict', 'summary', 'findings'],
 }
 
+/** Set an entry in a bounded Map, refreshing insertion order as a lightweight LRU. */
+export function boundedSet(map, key, value, maxEntries = MAX_TRACKED_ROOTS) {
+  if (map.has(key)) map.delete(key)
+  map.set(key, value)
+  while (map.size > maxEntries) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
+}
+
+/**
+ * Reconcile a model id with a reasoning effort.
+ *
+ * agy's model ids carry the effort as a suffix (`gemini-4-hydrogen-high`), and
+ * passing `--effort` alongside a suffixed id is rejected as a conflict. So a
+ * suffixed id wins: the effort argument is dropped rather than fighting the id.
+ * An unsuffixed id (an orchestrator, a raw family name) takes the effort.
+ */
+export function reconcileEffort(model, effort) {
+  if (model === undefined) return { model, effort }
+  const suffix = AGY_EFFORTS.find(candidate => model.endsWith(`-${candidate}`))
+  if (suffix === undefined) return { model, effort }
+  return { model, effort: undefined, implied: suffix }
+}
+
+/**
+ * Decide the gate verdict from agy's structured review output.
+ *
+ * A `fail` carrying only minor/nit notes passes with notes; a `fail` with zero
+ * findings still locks the gate so an unexplained failure cannot slip through.
+ */
+export function resolveVerdict(structured) {
+  const findings = Array.isArray(structured?.findings) ? structured.findings : []
+  const blocking = findings.some((finding) => BLOCKING.has(finding?.severity))
+  const emptyFail = structured?.verdict === 'fail' && findings.length === 0
+  return blocking || emptyFail ? 'fail' : 'pass'
+}
+
 /** Bound one CLI answer so a runaway plan cannot flood the conversation. */
-function summarise(text, limit = 24000) {
+export function summarise(text, limit = 24000) {
   const value = text.trim()
   return value.length > limit ? `${value.slice(0, limit)}\n…[truncated ${value.length - limit} chars]` : value
 }
 
 /** The launcher reports a signed-out CLI only on stderr; surface it as advice. */
-function authHint(stderr) {
+export function authHint(stderr) {
   return /not logged into Antigravity/i.test(stderr)
     ? 'Antigravity CLI is not signed in. Sign in once in a terminal (`agy`, then finish the Google sign-in), then retry.'
     : undefined
+}
+
+/**
+ * Whether a failure looks transient: a gateway hiccup or a throttled account is
+ * worth one more attempt, a bad model id is not.
+ */
+export function transientHint(output) {
+  return /(?:\b50[234]\b|rate.?limit|overloaded|temporarily unavailable|entitlement|try again later)/i.test(output)
 }
 
 /** One collected subprocess stream as text, tolerating a truncated tail. */
@@ -91,16 +164,165 @@ const objectSchema = (properties, required = []) => ({
   ...required.length === 0 ? {} : { required },
 })
 
+/** Unquote a `git status --porcelain` path when git C-quotes special characters. */
+function unquoteGitPath(raw) {
+  const trimmed = raw.trim()
+  if (!(trimmed.startsWith('"') && trimmed.endsWith('"'))) return trimmed
+  return trimmed
+    .slice(1, -1)
+    .replace(/\\([\\"tnr])/g, (_m, ch) => ({ '\\': '\\', '"': '"', t: '\t', n: '\n', r: '\r' }[ch] ?? ch))
+}
+
+/** Parse `git status --porcelain -uall` output into display lines and untracked paths. */
+export function parsePorcelainStatus(stdout) {
+  const lines = stdout.split(/\r?\n/).filter(line => line.length >= 4)
+  const files = lines.map(line => line.trim())
+  const untracked = []
+  for (const line of lines) {
+    if (!line.startsWith('?? ')) continue
+    const path = unquoteGitPath(line.slice(3))
+    if (path.length > 0 && !path.endsWith('/')) untracked.push(path)
+  }
+  return { files, untracked }
+}
+
+/** Extract the `b/...` path from a `diff --git` chunk header. */
+function diffChunkPath(chunk) {
+  const firstLine = chunk.split(/\r?\n/, 1)[0] ?? ''
+  const match = firstLine.match(/^diff --git a\/.+ b\/(.+)$/)
+  return match === null ? undefined : unquoteGitPath(match[1])
+}
+
+/**
+ * Clip a unified diff to `maxChars`, keeping source files ahead of lockfiles
+ * and generated bundles so noise does not crowd out real code changes.
+ */
+export function prioritizeAndClipDiff(diffText, maxChars) {
+  if (diffText.length <= maxChars) return { diff: diffText, omittedFiles: [] }
+
+  const chunks = diffText.split(/^(?=diff --git )/m).filter(chunk => chunk.length > 0)
+  if (chunks.length <= 1) {
+    const omitted = chunks.length === 1 ? [diffChunkPath(chunks[0])].filter(Boolean) : []
+    return {
+      diff: `${diffText.slice(0, maxChars)}\n…[diff truncated at ${maxChars} chars; ${diffText.length - maxChars} omitted]`,
+      omittedFiles: omitted,
+    }
+  }
+
+  const primary = []
+  const secondary = []
+  for (const chunk of chunks) {
+    const file = diffChunkPath(chunk)
+    if (file !== undefined && LOW_PRIORITY_DIFF_RE.test(file)) secondary.push({ file, chunk })
+    else primary.push({ file, chunk })
+  }
+
+  const kept = []
+  const omittedFiles = []
+  let used = 0
+  const reserve = 256
+  const limit = Math.max(0, maxChars - reserve)
+
+  for (const item of [...primary, ...secondary]) {
+    if (used + item.chunk.length <= limit) {
+      kept.push(item.chunk)
+      used += item.chunk.length
+      continue
+    }
+    if (kept.length === 0 && limit > 0) {
+      kept.push(`${item.chunk.slice(0, limit)}\n…[file diff truncated]`)
+      used = limit
+    }
+    if (item.file !== undefined) omittedFiles.push(item.file)
+  }
+
+  const suffix = omittedFiles.length === 0
+    ? ''
+    : `\n…[diff truncated at ${maxChars} chars; omitted/clipped files: ${omittedFiles.join(', ')}]`
+  return { diff: `${kept.join('')}${suffix}`, omittedFiles }
+}
+
+/** Format untracked non-binary text files into synthetic diff blocks within `budgetChars`. */
+async function collectUntrackedDiffs(cwd, untracked, budgetChars) {
+  if (untracked.length === 0 || budgetChars <= 256) {
+    return { text: '', omitted: [...untracked] }
+  }
+  const root = resolve(cwd)
+  const blocks = []
+  const omitted = []
+  let remaining = budgetChars
+
+  for (const relPath of untracked) {
+    const absPath = resolve(root, relPath)
+    if (absPath !== root && !absPath.startsWith(`${root}${sep}`)) {
+      omitted.push(relPath)
+      continue
+    }
+    if (remaining < 200) {
+      omitted.push(relPath)
+      continue
+    }
+    let buf
+    try {
+      const info = await stat(absPath)
+      if (!info.isFile()) continue
+      if (info.size > 256 * 1024) {
+        omitted.push(`${relPath} (${info.size} bytes)`)
+        continue
+      }
+      buf = await readFile(absPath)
+    } catch {
+      omitted.push(relPath)
+      continue
+    }
+
+    // Skip binary files containing NUL bytes in the leading sample.
+    const sampleLen = Math.min(buf.length, 4096)
+    let isBinary = false
+    for (let i = 0; i < sampleLen; i++) {
+      if (buf[i] === 0) {
+        isBinary = true
+        break
+      }
+    }
+    if (isBinary) {
+      omitted.push(`${relPath} (binary)`)
+      continue
+    }
+
+    const content = buf.toString('utf8')
+    const lines = content.length === 0 ? [] : content.replace(/\r\n/g, '\n').split('\n')
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+    const body = lines.map(line => `+${line}`).join('\n')
+    const header = `diff --git a/${relPath} b/${relPath}\nnew file mode 100644\n--- /dev/null\n+++ b/${relPath}\n@@ -0,0 +1,${lines.length} @@\n`
+    const fullBlock = `${header}${body}\n`
+    if (fullBlock.length <= remaining) {
+      blocks.push(fullBlock)
+      remaining -= fullBlock.length
+    } else if (blocks.length === 0 && remaining > header.length + 80) {
+      const sliceLen = remaining - header.length - 64
+      blocks.push(`${header}${body.slice(0, sliceLen)}\n…[new file truncated]\n`)
+      remaining = 0
+      omitted.push(`${relPath} (partial)`)
+    } else {
+      omitted.push(relPath)
+    }
+  }
+
+  return { text: blocks.join(''), omitted }
+}
+
 /** Render one review as model-facing text, strongest findings first. */
-function renderReview(review) {
+export function renderReview(review, { round, cost, scope }) {
   const order = { blocker: 0, major: 1, minor: 2, nit: 3 }
-  const findings = [...review.findings].sort((a, b) => order[a.severity] - order[b.severity])
-  const blocking = findings.filter((finding) => finding.severity === 'blocker' || finding.severity === 'major')
+  const findings = [...review.findings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9))
+  const blocking = findings.filter((finding) => BLOCKING.has(finding.severity))
+  const notes = findings.length === 0
+    ? 'agy review: PASS'
+    : 'agy review: PASS with notes'
   const head = review.verdict === 'pass'
-    ? blocking.length === 0 && findings.length === 0
-      ? 'agy review: PASS'
-      : 'agy review: PASS with notes'
-    : `agy review: FAIL — ${blocking.length} blocking finding(s) to fix before reporting completion`
+    ? notes
+    : `agy review: FAIL — ${blocking.length} blocking finding(s) remain (round ${round})`
   const body = findings.map((finding) => {
     const where = finding.file === undefined
       ? ''
@@ -108,7 +330,11 @@ function renderReview(review) {
     const fix = finding.fix === undefined ? '' : `\n   fix: ${finding.fix}`
     return `- [${finding.severity}] ${finding.problem}${where}${fix}`
   })
-  return [head, review.summary, ...body].join('\n')
+  const foot = [
+    review.verdict === 'pass' ? undefined : 'Fix every blocker and major, then call agy_review again.',
+    `scope: ${scope}${cost === undefined ? '' : ` · ${cost}`}`,
+  ].filter(line => line !== undefined)
+  return [head, review.summary, ...body, '', ...foot].join('\n')
 }
 
 export function apply(ctx, config = {}) {
@@ -117,6 +343,43 @@ export function apply(ctx, config = {}) {
   const defaultModel = config.defaultModel
   const defaultEffort = config.defaultEffort
   const requireReview = config.requireReview ?? true
+  const extraArgs = Array.isArray(config.extraArgs) ? config.extraArgs.map(String) : []
+
+  /**
+   * Three tiers, because one effort for everything is either too expensive or
+   * too shallow. A plan is the one place a strong model pays for itself; a
+   * mid-task lookup does not; the final review is worth the strong route again.
+   */
+  const tiers = {
+    plan: {
+      model: config.planModel ?? defaultModel,
+      effort: config.planEffort ?? defaultEffort,
+    },
+    consult: {
+      model: config.consultModel ?? defaultModel,
+      effort: config.consultEffort ?? 'low',
+    },
+    review: {
+      model: config.reviewModel ?? defaultModel,
+      effort: config.reviewEffort ?? config.planEffort ?? defaultEffort,
+    },
+  }
+
+  /** Whether a follow-up resumes the earlier agy conversation. */
+  const reuseConversations = config.reuseConversations ?? true
+  /** Turns one conversation may accumulate before a fresh one is started. */
+  const maxConversationTurns = config.maxConversationTurns ?? 12
+  /** Consecutive failing reviews before the mode stops looping. */
+  const maxReviewRounds = config.maxReviewRounds ?? 3
+  /** How much of the working-tree diff is sent to agy (bounded on win32 argv). */
+  const configuredDiffMaxChars = config.diffMaxChars ?? 48000
+  const diffMaxChars = process.platform === 'win32'
+    ? Math.min(configuredDiffMaxChars, 18000)
+    : configuredDiffMaxChars
+  /** Maximum total prompt characters passed on argv to avoid E2BIG / ENAMETOOLONG. */
+  const maxPromptChars = config.maxPromptChars ?? (process.platform === 'win32' ? 26000 : 96000)
+  /** Extra attempts for a transient gateway or throttle failure. */
+  const retries = config.retries ?? 1
 
   /**
    * The user's delegation answer, keyed by the root Session it belongs to so
@@ -126,22 +389,44 @@ export function apply(ctx, config = {}) {
   const budgets = new Map()
 
   /**
-   * Per-Session review gate state:
-   *   dirty    the agent changed something since its last review
-   *   reviewed something was reviewed after those changes
-   *   nudge    the closing turn already asked for the review once
-   *   turn     the review's own turn, so a review never demands another review
+   * User-chosen model/effort overrides per task root (`plan`, `consult`, `review`),
+   * recorded via `agy_routes` so subagents and compacted turns do not drift back
+   * to static defaults.
+   */
+  const routes = new Map()
+
+  /**
+   * agy conversations, keyed by the task root, so a follow-up resumes instead of
+   * restarting. One conversation per task on purpose: a plan, a lookup and a
+   * review all concern the same checkout, and splitting them would make agy
+   * re-explore a repository it has already read. A conversation is dropped when
+   * its directory changes, when it grows past `maxConversationTurns`, or when the
+   * CLI cannot resume it.
+   */
+  const conversations = new Map()
+
+  /** Per-task-root mutex so parallel calls do not race on the same agy conversation. */
+  const conversationLocks = new Map()
+
+  /** Accumulated agy spend per task root, so the cost is visible, not guessed. */
+  const spends = new Map()
+
+  /** Base commit SHA captured before first mutation for `(rootId, cwd)`, so mid-task commits stay reviewable. */
+  const baseHeads = new Map()
+
+  /**
+   * Per-task-root review gate state:
+   *   dirty             something changed since its last review
+   *   dirtyReason       'edit' (file tool) or 'shell' (shell/terminal tool)
+   *   unresolved        blocking findings the last review raised and nobody has cleared
+   *   rounds            consecutive failing reviews, so a stuck loop stays bounded
+   *   nudgedTurn        the turn already steered, so one turn is nudged once
+   *   stalled           the round cap was hit; stop steering until new edits happen
+   *   findings          findings from the last failing review for incremental re-check
+   *   cleanFingerprint  repo hash recorded when the last review passed
+   *   lastCwd           cwd of the last review, for shell-only fingerprint verification
    */
   const gates = new Map()
-
-  const gateOf = (sessionId) => {
-    let gate = gates.get(sessionId)
-    if (gate === undefined) {
-      gate = { dirty: false, reviewed: false, nudge: 0, turn: undefined }
-      gates.set(sessionId, gate)
-    }
-    return gate
-  }
 
   const depthOf = agent => agent.session.header.delegationDepth ?? 0
 
@@ -175,6 +460,25 @@ export function apply(ctx, config = {}) {
     return rootIdByHeaders(agent.session)
   }
 
+  const gateOf = (rootId) => {
+    let gate = gates.get(rootId)
+    if (gate === undefined) {
+      gate = {
+        dirty: false,
+        dirtyReason: undefined,
+        unresolved: undefined,
+        rounds: 0,
+        nudgedTurn: undefined,
+        stalled: false,
+        findings: undefined,
+        cleanFingerprint: undefined,
+        lastCwd: undefined,
+      }
+      boundedSet(gates, rootId, gate)
+    }
+    return gate
+  }
+
   /** Every live Session below `rootId`, counted through the durable headers. */
   function liveDescendants(rootId) {
     const agents = ctx.get('agents')
@@ -191,6 +495,135 @@ export function apply(ctx, config = {}) {
       }
     }
     return seen.size - 1
+  }
+
+  /** Add one call's token accounting to the task total. */
+  function recordSpend(rootId, usage) {
+    if (usage === undefined || usage === null) return
+    const spend = spends.get(rootId) ?? { calls: 0, input: 0, output: 0, cached: 0, thinking: 0 }
+    const number = value => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+    spend.calls += 1
+    spend.input += number(usage.input_tokens)
+    spend.output += number(usage.output_tokens)
+    spend.cached += number(usage.cache_read_tokens)
+    spend.thinking += number(usage.thinking_tokens)
+    boundedSet(spends, rootId, spend)
+  }
+
+  /** One line of spend, compact enough to ride along with every answer. */
+  function costLine(rootId) {
+    const spend = spends.get(rootId)
+    if (spend === undefined || spend.calls === 0) return undefined
+    const scale = value => (value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value))
+    const cached = spend.input > 0 ? ` (${Math.min(100, Math.round((spend.cached / spend.input) * 100))}% cached)` : ''
+    const thinking = spend.thinking > 0 ? `, ${scale(spend.thinking)} thinking` : ''
+    return `agy so far: ${spend.calls} call(s), ${scale(spend.input)} in${cached}, ${scale(spend.output)} out${thinking}`
+  }
+
+  /** Serialize async operations for the same task root to avoid conversation races. */
+  async function withRootLock(key, fn) {
+    if (key === undefined) return fn()
+    const prev = conversationLocks.get(key) ?? Promise.resolve()
+    let release
+    const gate = new Promise(resolve => { release = resolve })
+    const chain = prev.then(() => gate, () => gate)
+    conversationLocks.set(key, chain)
+    await prev.catch(() => {})
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (conversationLocks.get(key) === chain) conversationLocks.delete(key)
+    }
+  }
+
+  /** Run one short-lived command in `cwd` and collect its text. */
+  async function runCommand(argv, cwd, signal, maxBytes = 1024 * 1024) {
+    const executable = await ctx.subprocess.resolveExecutable(argv[0], undefined, signal)
+    const handle = ctx.subprocess.spawn({
+      argv: [executable, ...argv.slice(1)],
+      cwd,
+      stdio: {
+        stdin: 'ignore',
+        stdout: { maxBytes },
+        stderr: { maxBytes: 64 * 1024 },
+      },
+      graceMs: 3000,
+      signal,
+    })
+    const { exitCode } = await handle.done
+    return { exitCode, stdout: textOf(handle.collected.stdout), stderr: textOf(handle.collected.stderr) }
+  }
+
+  /** Capture the initial HEAD commit for `(rootId, cwd)` if not yet recorded. */
+  async function ensureBaseHead(rootId, cwd, signal) {
+    if (rootId === undefined || cwd === undefined) return undefined
+    const key = `${rootId}\0${cwd}`
+    if (baseHeads.has(key)) return baseHeads.get(key)
+    try {
+      const head = await runCommand(['git', 'rev-parse', '--verify', 'HEAD'], cwd, signal, 4096)
+      if (head.exitCode === 0) {
+        const sha = head.stdout.trim()
+        if (sha.length > 0) {
+          boundedSet(baseHeads, key, sha)
+          return sha
+        }
+      }
+    } catch {
+      // Not a git repo or unborn HEAD; ignore.
+    }
+    return undefined
+  }
+
+  /** Compute a lightweight working-tree + HEAD fingerprint for shell-only dirty checks. */
+  async function repoFingerprint(cwd, signal) {
+    try {
+      const status = await runCommand(['git', 'status', '--porcelain', '-uall'], cwd, signal, 512 * 1024)
+      if (status.exitCode !== 0) return undefined
+      const head = await runCommand(['git', 'rev-parse', '--verify', 'HEAD'], cwd, signal, 4096)
+      let diff = head.exitCode === 0
+        ? await runCommand(['git', '--no-pager', 'diff', 'HEAD'], cwd, signal, 4 * 1024 * 1024)
+        : await runCommand(['git', '--no-pager', 'diff'], cwd, signal, 4 * 1024 * 1024)
+      if (diff.exitCode !== 0) return undefined
+
+      const hash = createHash('sha256')
+      hash.update(head.exitCode === 0 ? head.stdout.trim() : 'UNBORN')
+      hash.update('\0')
+      hash.update(status.stdout)
+      hash.update('\0')
+      hash.update(diff.stdout)
+
+      const { untracked } = parsePorcelainStatus(status.stdout)
+      const root = resolve(cwd)
+      for (const relPath of untracked.slice(0, 200)) {
+        const absPath = resolve(root, relPath)
+        if (absPath !== root && !absPath.startsWith(`${root}${sep}`)) continue
+        try {
+          const info = await stat(absPath)
+          hash.update(`\0${relPath}:${info.size}:${info.mtimeMs}`)
+        } catch {
+          hash.update(`\0${relPath}:missing`)
+        }
+      }
+      return hash.digest('hex')
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The directory agy should explore: explicit, else the session's directory. */
+  function resolveCwd(args, exec) {
+    if (args?.cwd !== undefined) return args.cwd
+    const session = exec?.agent?.session
+    const workingDirectory = ctx.get('workingDirectory')
+    if (workingDirectory !== undefined && session !== undefined) {
+      try {
+        return workingDirectory.get(session)
+      } catch {
+        // Fall through to the session header.
+      }
+    }
+    return session?.header.cwd ?? process.cwd()
   }
 
   // Enforce the user's answer on every delegated start. A guard is monotonic:
@@ -216,150 +649,343 @@ export function apply(ctx, config = {}) {
     return undefined
   }), 'agy-mode.delegation-guard')
 
-  // Track whether the agent changed anything since its last review. Anything
-  // that can mutate the workspace marks the Session dirty; a review clears it.
+  // Track whether the task root changed anything since its last review, and what
+  // the last review left unresolved. Keyed by rootId so subagent edits mark
+  // the root task dirty too.
   ctx.effect(() => ctx.on('tools/execute', async (execution, next) => {
     const agent = execution.agent
+    const rootId = agent === undefined ? undefined : rootIdOf(agent)
+    const isMutating = MUTATING_TOOLS.has(execution.name)
+    if (isMutating && rootId !== undefined) {
+      const cwd = resolveCwd(execution.args, { agent })
+      await ensureBaseHead(rootId, cwd, execution.signal)
+    }
+
     const result = await next()
-    if (agent === undefined) return result
-    const gate = gateOf(agent.session.id)
+    if (agent === undefined || rootId === undefined) return result
+    const gate = gateOf(rootId)
+
     if (execution.name === 'agy_review' && result.isError === false) {
+      const value = result.value ?? {}
+      const findings = Array.isArray(value.findings) ? value.findings : []
+      const blocking = findings.filter((finding) => BLOCKING.has(finding.severity))
       gate.dirty = false
-      gate.reviewed = true
-      gate.nudge = 0
+      gate.dirtyReason = undefined
+      gate.nudgedTurn = undefined
+      gate.lastCwd = resolveCwd(execution.args, { agent })
+      if (value.verdict === 'pass') {
+        gate.unresolved = undefined
+        gate.rounds = 0
+        gate.stalled = false
+        gate.findings = undefined
+      } else {
+        // Keep the gate shut: a fail only clears once a later review passes.
+        gate.unresolved = blocking.length > 0 ? blocking : [{ severity: 'major', problem: 'agy reported a failure without naming a finding' }]
+        gate.rounds += 1
+        gate.findings = findings
+        gate.cleanFingerprint = undefined
+      }
       return result
     }
-    if (MUTATING_TOOLS.has(execution.name) && result.isError === false) {
+    if (isMutating && result.isError === false) {
       gate.dirty = true
-      if (gate.nudge > 0) gate.nudge = 0
+      gate.dirtyReason = FILE_MUTATING_TOOLS.has(execution.name) ? 'edit' : (gate.dirtyReason ?? 'shell')
+      gate.nudgedTurn = undefined
+      // Once new work happens after hitting the round cap, re-arm the gate.
+      if (gate.stalled) {
+        gate.stalled = false
+        gate.rounds = 0
+      }
     }
     return result
   }), 'agy-mode.review-gate')
 
+  /** Compose the steering text for one closing turn. */
+  function nudgeText(gate) {
+    if (gate.unresolved !== undefined) {
+      const list = gate.unresolved
+        .map((finding) => `[${finding.severity}] ${finding.problem}`)
+        .join('; ')
+      if (gate.rounds >= maxReviewRounds) {
+        return `agy has rejected this work ${gate.rounds} times and the findings are still: ${list}. Stop looping: report the disagreement to the user — what agy objects to, what you changed each round, and what you would do with their guidance. Do not mark the task complete on your own authority.`
+      }
+      return `agy still rejects this work: ${list}. Fix every blocker and major, then call \`agy_review\` again with the new diff. Do not report the task as done while agy fails it; if you believe a finding is wrong, say why and let the user decide.`
+    }
+    if (gate.rounds >= maxReviewRounds) return undefined
+    return 'Before you report this task as done: the work changed since it was last reviewed, and quality is agy\'s call. Call `agy_review` now (default `scope: diff` sends the working-tree diff for you), include how you verified it, and address every blocker and major finding. If the user asked you not to review, say so and finish.'
+  }
+
   /**
-   * A turn must not close on unreviewed changes. Steering adds one instruction
-   * to the closing turn; it never blocks the turn outright, so a user who
-   * declines the review can always end the task.
+   * A turn must not close on unreviewed — or reviewed-but-unfixed — changes.
+   * Steering adds one instruction to the closing turn; it never blocks the turn
+   * outright, so a user who declines the review can always end the task.
    */
   if (requireReview) {
     ctx.effect(() => ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
       if (agent.session.header.parentSession !== undefined && depthOf(agent) > 0) return
-      const gate = gateOf(agent.session.id)
-      if (!gate.dirty || gate.nudge > 0) return
-      gate.nudge = turn
+      const gate = gateOf(rootIdOf(agent))
+      if (!gate.dirty && gate.unresolved === undefined) return
+      if (gate.nudgedTurn === turn) return
+      if (gate.stalled) return
+
+      // Read-only shell runs (`git status`, `npm test`) after a clean review
+      // must not force an unnecessary re-review if the repository is unchanged.
+      if (gate.dirty && gate.unresolved === undefined && gate.dirtyReason === 'shell' && gate.cleanFingerprint !== undefined && gate.lastCwd !== undefined) {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 2000)
+        try {
+          const current = await repoFingerprint(gate.lastCwd, controller.signal)
+          if (current !== undefined && current === gate.cleanFingerprint) {
+            gate.dirty = false
+            gate.dirtyReason = undefined
+            return
+          }
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+
+      const body = nudgeText(gate)
+      if (body === undefined) return
+      gate.nudgedTurn = turn
+      if (gate.unresolved !== undefined && gate.rounds >= maxReviewRounds) gate.stalled = true
       agent.steer({
         // A steered message carries the same required fields as any user
         // message: identity, role, content, and its producer tag.
         id: randomUUID(),
         role: 'user',
         source: { kind: 'user' },
-        content: [{
-          type: 'text',
-          text: 'Before you report this task as done: the work changed since it was last reviewed, and quality is agy\'s call. Call `agy_review` now with a self-contained description of what you changed and how you verified it (include the diff summary and the test or check results). Address every blocker and major finding, then report. If the user asked you not to review, say so and finish.',
-        }],
+        content: [{ type: 'text', text: body }],
       })
     }), 'agy-mode.review-reminder')
   }
 
-  /** The directory agy should explore: explicit, else the session's directory. */
-  function resolveCwd(args, exec) {
-    if (args.cwd !== undefined) return args.cwd
-    const session = exec.agent?.session
-    const workingDirectory = ctx.get('workingDirectory')
-    if (workingDirectory !== undefined && session !== undefined) {
-      try {
-        return workingDirectory.get(session)
-      } catch {
-        // Fall through to the session header.
+  /**
+   * Collect what actually changed in the repository (working tree + any commits
+   * created since the task's base HEAD + non-binary untracked files).
+   */
+  async function collectDiff(cwd, exec, baseHead) {
+    const status = await runCommand(['git', 'status', '--porcelain', '-uall'], cwd, exec.signal)
+    if (status.exitCode !== 0) return undefined
+
+    let diffRef = 'HEAD'
+    let commits = ''
+    let baseLabel = 'working tree against HEAD'
+    const headCheck = await runCommand(['git', 'rev-parse', '--verify', 'HEAD'], cwd, exec.signal, 4096)
+    const hasHead = headCheck.exitCode === 0
+    const currentHead = hasHead ? headCheck.stdout.trim() : undefined
+
+    if (hasHead && baseHead !== undefined && baseHead !== currentHead) {
+      const checkBase = await runCommand(['git', 'cat-file', '-e', `${baseHead}^{commit}`], cwd, exec.signal, 4096)
+      if (checkBase.exitCode === 0) {
+        diffRef = baseHead
+        baseLabel = `working tree + commits since ${baseHead.slice(0, 7)}`
+        const logRes = await runCommand(['git', '--no-pager', 'log', '--oneline', `${baseHead}..HEAD`], cwd, exec.signal, 64 * 1024)
+        if (logRes.exitCode === 0) commits = logRes.stdout.trim()
       }
     }
-    return session?.header.cwd ?? process.cwd()
+
+    let diff = hasHead
+      ? await runCommand(['git', '--no-pager', 'diff', diffRef], cwd, exec.signal, 8 * 1024 * 1024)
+      : await runCommand(['git', '--no-pager', 'diff'], cwd, exec.signal, 8 * 1024 * 1024)
+    if (diff.exitCode !== 0 && hasHead && diffRef !== 'HEAD') {
+      diff = await runCommand(['git', '--no-pager', 'diff', 'HEAD'], cwd, exec.signal, 8 * 1024 * 1024)
+      diffRef = 'HEAD'
+      baseLabel = 'working tree against HEAD'
+      commits = ''
+    }
+    if (diff.exitCode !== 0) return undefined
+
+    const { files, untracked } = parsePorcelainStatus(status.stdout)
+    const body = diff.stdout
+    if (body.trim().length === 0 && untracked.length === 0) {
+      return { empty: true, files, untracked, omittedUntracked: [], diff: '', stat: '', commits, baseLabel }
+    }
+
+    let statText = ''
+    if (body.length > diffMaxChars) {
+      const statRes = hasHead
+        ? await runCommand(['git', '--no-pager', 'diff', '--stat', diffRef], cwd, exec.signal, 128 * 1024)
+        : await runCommand(['git', '--no-pager', 'diff', '--stat'], cwd, exec.signal, 128 * 1024)
+      if (statRes.exitCode === 0) statText = statRes.stdout.trim()
+    }
+
+    const clipped = prioritizeAndClipDiff(body, diffMaxChars)
+    const remainingBudget = Math.max(0, diffMaxChars - clipped.diff.length)
+    const untrackedResult = await collectUntrackedDiffs(cwd, untracked, remainingBudget)
+    const combined = [clipped.diff.trimEnd(), untrackedResult.text.trimEnd()].filter(Boolean).join('\n\n')
+
+    return {
+      empty: false,
+      files,
+      untracked,
+      omittedUntracked: untrackedResult.omitted,
+      diff: combined,
+      stat: statText,
+      commits,
+      baseLabel,
+    }
+  }
+
+  /** Effective default model & effort for a tier, factoring in task-level `agy_routes` overrides. */
+  function resolveTierRoute(rootId, purpose) {
+    const base = tiers[purpose] ?? tiers.consult
+    const override = rootId === undefined ? undefined : routes.get(rootId)
+    if (override === undefined) return base
+    const specific = override[purpose]
+    const fallback = purpose === 'review' ? override.plan : undefined
+    return {
+      model: specific?.model ?? fallback?.model ?? override.default?.model ?? base.model,
+      effort: specific?.effort ?? fallback?.effort ?? override.default?.effort ?? base.effort,
+    }
   }
 
   /**
-   * Run one `agy` print-mode turn.
+   * Run one `agy` print-mode turn, resuming the task's conversation when it can.
    * @param args the tool arguments.
    * @param exec the tool run context.
-   * @param options.mode `plan` or `review`; review adds the reviewer brief.
+   * @param options.purpose which tier and conversation this call belongs to.
    * @param options.schema a JSON Schema agy must satisfy, for structured output.
    * @param options.prompt the prompt text to send.
    */
-  async function runAgy(args, exec, { mode, schema, prompt }) {
-    const model = args.model ?? defaultModel
-    const effort = args.effort ?? defaultEffort
-    if (effort !== undefined && !AGY_EFFORTS.includes(effort)) {
-      throw new Error(`unknown reasoning effort ${JSON.stringify(effort)}; use one of ${AGY_EFFORTS.join(', ')}`)
+  async function runAgy(args, exec, { purpose, schema, prompt }) {
+    if (args.effort !== undefined && !AGY_EFFORTS.includes(args.effort)) {
+      throw new Error(`unknown reasoning effort ${JSON.stringify(args.effort)}; use one of ${AGY_EFFORTS.join(', ')}`)
     }
+    const cwd = resolveCwd(args, exec)
+    const rootId = exec.agent === undefined ? undefined : rootIdOf(exec.agent)
+    const tier = resolveTierRoute(rootId, purpose)
+    // A model id that already carries the effort wins over the tier's effort.
+    const { model, effort } = reconcileEffort(args.model ?? tier.model, args.effort ?? tier.effort)
+
+    // Guard argv against Windows 32k / Linux MAX_ARG_STRLEN limits.
+    const boundedPrompt = prompt.length > maxPromptChars
+      ? `${prompt.slice(0, maxPromptChars)}\n…[prompt truncated at ${maxPromptChars} chars to fit CLI argv limit]`
+      : prompt
 
     const executable = await ctx.subprocess.resolveExecutable(command, undefined, exec.signal)
-    const argv = [
-      executable,
-      '--print', prompt,
-      '--dangerously-skip-permissions',
-      '--output-format', 'json',
-      // The CLI's own plan mode is read-only: it may inspect, never modify.
-      '--mode', 'plan',
-    ]
-    if (model !== undefined) argv.push('--model', model)
-    if (effort !== undefined) argv.push('--effort', effort)
-    if (timeoutSeconds > 0) argv.push('--print-timeout', `${timeoutSeconds}s`)
-    if (schema !== undefined) argv.push('--json-schema', JSON.stringify(schema))
-    // Keep the CLI's own log outside the checkout it is reading.
-    argv.push('--log-file', join(tmpdir(), 'dsh-agy-consult.log'))
 
-    const handle = ctx.subprocess.spawn({
-      argv,
-      cwd: resolveCwd(args, exec),
-      stdio: {
-        stdin: 'ignore',
-        stdout: { maxBytes: 4 * 1024 * 1024 },
-        stderr: { maxBytes: 256 * 1024 },
-      },
-      graceMs: 5000,
-      signal: exec.signal,
+    return withRootLock(rootId, async () => {
+      const logFile = join(tmpdir(), `dsh-agy-${process.pid}-${randomUUID().slice(0, 8)}.log`)
+
+      /** One attempt. `resume` is the conversation id to continue, if any. */
+      const attempt = async (resume) => {
+        const argv = [
+          executable,
+          '--print', boundedPrompt,
+          '--dangerously-skip-permissions',
+          '--output-format', 'json',
+          // The CLI's own plan mode is read-only: it may inspect, never modify.
+          '--mode', 'plan',
+        ]
+        if (model !== undefined) argv.push('--model', model)
+        if (effort !== undefined) argv.push('--effort', effort)
+        if (timeoutSeconds > 0) argv.push('--print-timeout', `${timeoutSeconds}s`)
+        if (schema !== undefined) argv.push('--json-schema', JSON.stringify(schema))
+        if (resume !== undefined) argv.push('--conversation', resume)
+        if (extraArgs.length > 0) argv.push(...extraArgs)
+        // Per-call log outside the checkout so concurrent runs never contend.
+        argv.push('--log-file', logFile)
+
+        const handle = ctx.subprocess.spawn({
+          argv,
+          cwd,
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 4 * 1024 * 1024 },
+            stderr: { maxBytes: 256 * 1024 },
+          },
+          graceMs: 5000,
+          signal: exec.signal,
+        })
+        const { exitCode } = await handle.done
+        return { exitCode, stdout: textOf(handle.collected.stdout), stderr: textOf(handle.collected.stderr) }
+      }
+
+      // Reuse the conversation only when enabled, same cwd, and under turn cap.
+      const key = rootId
+      const known = reuseConversations && key !== undefined ? conversations.get(key) : undefined
+      let resume = known !== undefined && known.cwd === cwd && known.turns < maxConversationTurns ? known.id : undefined
+      if (key !== undefined && resume === undefined) conversations.delete(key)
+
+      let output
+      let transientAttempts = 0
+      try {
+        for (; ;) {
+          output = await attempt(resume)
+          if (output.exitCode === 0) break
+          const haystack = `${output.stdout}\n${output.stderr}`
+          // A conversation the CLI cannot resume must not fail the task: start cold once.
+          if (resume !== undefined) {
+            conversations.delete(key)
+            resume = undefined
+            continue
+          }
+          if (transientAttempts < retries && transientHint(haystack) && !exec.signal?.aborted) {
+            transientAttempts += 1
+            await new Promise(resolve => setTimeout(resolve, 400 * transientAttempts))
+            continue
+          }
+          break
+        }
+
+        if (output.exitCode !== 0) {
+          const hint = authHint(output.stderr)
+          const transient = transientHint(`${output.stdout}\n${output.stderr}`)
+          throw new Error(`agy exited with code ${output.exitCode}${hint === undefined ? '' : `. ${hint}`}${
+            transient ? ' The gateway or account looked temporarily unavailable; retrying the same call later may work, or run it on another model.' : ''
+          }\n${summarise(output.stderr, 4000)}`)
+        }
+      } finally {
+        await unlink(logFile).catch(() => {})
+      }
+
+      let parsed
+      try {
+        parsed = JSON.parse(output.stdout)
+      } catch {
+        // Plain-text output from an older CLI: report the raw answer.
+        const plain = summarise(output.stdout)
+        if (plain.length === 0) {
+          const hint = authHint(output.stderr)
+          throw new Error(`agy returned an empty answer.${hint === undefined ? ` stderr: ${summarise(output.stderr, 2000)}` : ` ${hint}`}`)
+        }
+        return { plain, model, effort, cost: rootId === undefined ? undefined : costLine(rootId) }
+      }
+
+      if (parsed.status !== undefined && parsed.status !== 'SUCCESS') {
+        throw new Error(`agy reported ${parsed.status}: ${summarise(parsed.response ?? output.stderr, 2000)}`)
+      }
+
+      // Remember the conversation so the next call in this task can continue it.
+      if (reuseConversations && key !== undefined && typeof parsed.conversation_id === 'string') {
+        boundedSet(conversations, key, {
+          id: parsed.conversation_id,
+          turns: typeof parsed.num_turns === 'number' ? parsed.num_turns : 1,
+          cwd,
+        })
+      }
+      if (rootId !== undefined) recordSpend(rootId, parsed.usage)
+
+      const usage = parsed.usage === undefined ? undefined : JSON.stringify(parsed.usage)
+      const cost = rootId === undefined ? undefined : costLine(rootId)
+      const structured = parsed.structured_output
+      const answer = typeof parsed.response === 'string' ? parsed.response : output.stdout
+      if (structured === undefined) {
+        const plain = summarise(answer)
+        if (plain.length === 0) {
+          const hint = authHint(output.stderr)
+          throw new Error(`agy returned no structured output and an empty answer.${hint === undefined ? '' : ` ${hint}`}`)
+        }
+        return { plain, model, effort, usage, cost }
+      }
+      return { structured, plain: summarise(answer), model, effort, usage, cost }
     })
-
-    const { exitCode } = await handle.done
-    const stdout = textOf(handle.collected.stdout)
-    const stderr = textOf(handle.collected.stderr)
-    if (exitCode !== 0) {
-      const hint = authHint(stderr)
-      throw new Error(`agy exited with code ${exitCode}${hint === undefined ? '' : `. ${hint}`}\n${summarise(stderr, 4000)}`)
-    }
-
-    let parsed
-    try {
-      parsed = JSON.parse(stdout)
-    } catch {
-      // Plain-text output from an older CLI: report the raw answer.
-      const plain = summarise(stdout)
-      if (plain.length === 0) {
-        const hint = authHint(stderr)
-        throw new Error(`agy returned an empty answer.${hint === undefined ? ` stderr: ${summarise(stderr, 2000)}` : ` ${hint}`}`)
-      }
-      return { plain, model, effort }
-    }
-
-    if (parsed.status !== undefined && parsed.status !== 'SUCCESS') {
-      throw new Error(`agy reported ${parsed.status}: ${summarise(parsed.response ?? stderr, 2000)}`)
-    }
-    const usage = parsed.usage === undefined ? undefined : JSON.stringify(parsed.usage)
-    const structured = parsed.structured_output
-    const answer = typeof parsed.response === 'string' ? parsed.response : stdout
-    if (structured === undefined) {
-      const plain = summarise(answer)
-      if (plain.length === 0) {
-        const hint = authHint(stderr)
-        throw new Error(`agy returned no structured output and an empty answer.${hint === undefined ? '' : ` ${hint}`}`)
-      }
-      return { plain, model, effort, usage }
-    }
-    return { structured, plain: summarise(answer), model, effort, usage }
   }
 
   ctx.tools.register({
     name: 'agy_consult',
-    description: 'Ask the local Antigravity CLI (agy) to plan work or to review it in prose. agy explores the repository read-only and returns its plan or critique; DSH carries out every change itself. agy does not see this conversation, so the prompt must be self-contained. For a quality gate on finished work, use agy_review instead.',
+    description: 'Ask the local Antigravity CLI (agy) to plan work or to critique it in prose. agy explores the repository read-only; DSH carries out every change itself. Follow-ups in the same task resume the earlier agy conversation, so a short question stays short. agy does not see this conversation, so the prompt must be self-contained. For the quality gate on finished work, use agy_review instead.',
     parameters: objectSchema({
       prompt: {
         type: 'string',
@@ -367,17 +993,17 @@ export function apply(ctx, config = {}) {
       },
       mode: {
         type: 'string',
-        enum: ['plan', 'review'],
-        description: 'plan (default) asks for an implementation plan; review asks for a prose critique. Both run in read-only plan mode.',
+        enum: ['plan', 'review', 'quick'],
+        description: 'plan (default) asks for an implementation plan at the planning tier; review asks for a prose critique; quick is a cheap, low-effort answer for a lookup or a small decision.',
       },
       model: {
         type: 'string',
-        description: 'agy model id from agy_models. Omit for the configured default.',
+        description: 'agy model id from agy_models. Omit for the tier default.',
       },
       effort: {
         type: 'string',
         enum: AGY_EFFORTS,
-        description: 'Reasoning effort for this consultation. Omit for the configured default.',
+        description: 'Reasoning effort for this consultation. Omit for the tier default.',
       },
       cwd: {
         type: 'string',
@@ -390,35 +1016,47 @@ export function apply(ctx, config = {}) {
         model: { type: 'string' },
         effort: { type: 'string' },
         usage: { type: 'string' },
+        cost: { type: 'string' },
       }, ['text']),
-      render: (_args, value) => text(value.text),
+      render: (_args, value) => text(value.cost === undefined ? value.text : `${value.text}\n\n${value.cost}`),
     },
     timeoutMs: 60 * 60 * 1000,
     async execute(args, exec) {
-      const prompt = args.mode === 'review'
+      const mode = args.mode ?? 'plan'
+      const prompt = mode === 'review'
         ? `Review the work described below as a skeptical senior engineer. Report concrete defects, risks and missing tests with file paths and line numbers. Do not modify any file.\n\n${args.prompt}`
         : args.prompt
-      const result = await runAgy(args, exec, { mode: args.mode ?? 'plan', prompt })
+      const result = await runAgy(args, exec, { purpose: mode === 'quick' ? 'consult' : 'plan', prompt })
       return {
-        text: result.structured === undefined ? result.plain : `${result.plain}`,
+        text: result.plain,
         ...result.model === undefined ? {} : { model: result.model },
         ...result.effort === undefined ? {} : { effort: result.effort },
         ...result.usage === undefined ? {} : { usage: result.usage },
+        ...result.cost === undefined ? {} : { cost: result.cost },
       }
     },
   })
 
   ctx.tools.register({
     name: 'agy_review',
-    description: 'Quality gate on finished work: agy inspects the repository and returns a structured verdict (pass/fail) with concrete findings, ranked by severity. Call it after implementing and verifying, before reporting completion. Blockers and major findings must be fixed or explicitly justified. Read-only: agy never changes files.',
+    description: 'Quality gate on finished work: agy returns a structured verdict (pass/fail) with concrete findings, ranked by severity. Call it after implementing and verifying, before reporting completion. By default the working-tree diff (plus new untracked files and any commits made during this task) is collected and sent, so agy judges the real change rather than a description; use scope "repo" only when it must follow callers across files. A failure keeps the gate shut until a later review passes. Read-only: agy never changes files.',
     parameters: objectSchema({
       work: {
         type: 'string',
-        description: 'Self-contained description of what was changed: the files, the intent, and how it was verified (test or check output). Include the diff summary.',
+        description: 'What was changed and why. Optional under scope "diff": the diff is collected for you.',
       },
       requirements: {
         type: 'string',
         description: 'What the work must satisfy: the user request, acceptance criteria, or the plan agy produced earlier.',
+      },
+      evidence: {
+        type: 'string',
+        description: 'How it was verified: the exact test or check commands and their outcome. Reviews without evidence are weak; paste the real output, not a claim.',
+      },
+      scope: {
+        type: 'string',
+        enum: ['diff', 'repo'],
+        description: 'diff (default) sends the collected working-tree diff; repo makes agy explore the checkout itself and costs a full cold start.',
       },
       focus: {
         type: 'array',
@@ -427,18 +1065,18 @@ export function apply(ctx, config = {}) {
       },
       model: {
         type: 'string',
-        description: 'agy model id from agy_models. Omit for the configured default.',
+        description: 'agy model id from agy_models. Omit for the review tier default.',
       },
       effort: {
         type: 'string',
         enum: AGY_EFFORTS,
-        description: 'Reasoning effort for this review. Omit for the configured default.',
+        description: 'Reasoning effort for this review. Omit for the review tier default.',
       },
       cwd: {
         type: 'string',
-        description: 'Directory agy explores. Defaults to the session working directory.',
+        description: 'Directory agy works from. Defaults to the session working directory.',
       },
-    }, ['work']),
+    }),
     output: {
       schema: objectSchema({
         verdict: { type: 'string', enum: ['pass', 'fail'] },
@@ -458,20 +1096,69 @@ export function apply(ctx, config = {}) {
             required: ['severity', 'problem'],
           },
         },
+        scope: { type: 'string' },
+        round: { type: 'number' },
         review: { type: 'string' },
-      }, ['verdict', 'summary', 'findings', 'review']),
+        cost: { type: 'string' },
+      }, ['verdict', 'summary', 'findings', 'scope', 'round', 'review']),
       render: (_args, value) => text(value.review),
     },
     timeoutMs: 60 * 60 * 1000,
     async execute(args, exec) {
+      const cwd = resolveCwd(args, exec)
+      const rootId = exec.agent === undefined ? undefined : rootIdOf(exec.agent)
+      const gate = rootId === undefined ? undefined : gateOf(rootId)
+      const baseHead = rootId === undefined ? undefined : baseHeads.get(`${rootId}\0${cwd}`)
+
+      // A diff is ground truth; a description is not. Collect one unless the
+      // caller explicitly asks agy to explore the checkout instead.
+      const wanted = args.scope ?? 'diff'
+      const collected = wanted === 'diff' ? await collectDiff(cwd, exec, baseHead) : undefined
+      const scope = collected !== undefined && !collected.empty ? 'diff' : 'repo'
+
+      if (scope === 'repo' && args.work === undefined) {
+        throw new Error('No working-tree diff was found and no `work` description was given. Describe what changed, or set scope "repo" to let agy explore.')
+      }
+
       const focus = args.focus === undefined || args.focus.length === 0
         ? 'correctness, error handling, tests, and whether the work actually satisfies the requirement'
         : args.focus.join(', ')
-      const prompt = [
-        'You are the quality gate for work another engineer just finished. Inspect the repository yourself; do not assume the description is accurate.',
+
+      const lines = [
+        'You are the quality gate for work another engineer just finished. Judge the code, not the description.',
         '',
-        `Work claimed: ${args.work}`,
-        ...args.requirements === undefined ? [] : ['', `Must satisfy: ${args.requirements}`],
+      ]
+      if (scope === 'diff') {
+        lines.push(`This is the complete change under review (${collected.baseLabel}). Files touched:`)
+        lines.push(collected.files.map(file => `  ${file}`).join('\n') || '  (committed since task start)')
+        if (collected.commits) {
+          lines.push('', 'Commits created during this task:', collected.commits)
+        }
+        if (collected.stat) {
+          lines.push('', 'Diff stat:', collected.stat)
+        }
+        if (collected.omittedUntracked.length > 0) {
+          lines.push(`Untracked files omitted due to size/binary/budget (open if needed): ${collected.omittedUntracked.join(', ')}`)
+        }
+        lines.push('', '```diff', collected.diff.trim() || '(empty)', '```')
+      } else {
+        lines.push('No diff was available. Inspect the repository yourself; do not assume the description is accurate.')
+      }
+      if (args.work !== undefined) lines.push('', `What the author says they did: ${args.work}`)
+      if (args.requirements !== undefined) lines.push('', `Must satisfy: ${args.requirements}`)
+      if (args.evidence !== undefined) lines.push('', `How they verified it: ${args.evidence}`)
+
+      // Incremental review: re-litigating findings already reported wastes a
+      // full call. Ask about what remains instead.
+      if (gate?.findings !== undefined && gate.rounds > 0) {
+        lines.push(
+          '',
+          'A previous review already reported these. Check each against the code above and only repeat the ones that still stand:',
+          ...gate.findings.map(finding => `  - [${finding.severity}] ${finding.problem}${finding.file === undefined ? '' : ` (${finding.file})`}`),
+        )
+      }
+
+      lines.push(
         '',
         `Weigh hardest: ${focus}.`,
         '',
@@ -480,9 +1167,9 @@ export function apply(ctx, config = {}) {
         'Judge the work against the requirement as stated, not against what you would have designed. A limitation the requirement never asked about is at most a minor note; never a blocker or major. When the requirement sets no contract for a case, say the case is uncovered rather than treating your assumed contract as broken.',
         'Blockers and major findings must be things that make the delivered work wrong, unsafe, or incomplete for what was asked.',
         'The verdict is "pass" when nothing at blocker or major severity remains; minor notes and nits may accompany a pass.',
-      ].join('\n')
+      )
 
-      const result = await runAgy(args, exec, { mode: 'review', schema: REVIEW_SCHEMA, prompt })
+      const result = await runAgy(args, exec, { purpose: 'review', schema: REVIEW_SCHEMA, prompt: lines.join('\n') })
       if (result.structured === undefined) {
         // Without a structured answer there is no verdict to trust: report the
         // prose so the caller can judge, and say the gate did not run.
@@ -491,12 +1178,16 @@ export function apply(ctx, config = {}) {
 
       const structured = result.structured
       const findings = Array.isArray(structured.findings) ? structured.findings : []
-      // A fail carrying nothing above minor is a pass with notes: the gate is
-      // about blockers and majors, so a nit never holds a finished task back.
-      const blocking = findings.some((finding) => finding.severity === 'blocker' || finding.severity === 'major')
-      const verdict = blocking ? 'fail' : 'pass'
+      const verdict = resolveVerdict(structured)
       const summary = typeof structured.summary === 'string' ? structured.summary : ''
+      const round = gate === undefined ? 1 : gate.rounds + 1
       const review = { verdict, summary, findings }
+
+      if (gate !== undefined && verdict === 'pass') {
+        gate.cleanFingerprint = await repoFingerprint(cwd, exec.signal)
+        gate.lastCwd = cwd
+      }
+
       return {
         verdict,
         summary,
@@ -507,40 +1198,110 @@ export function apply(ctx, config = {}) {
           problem: finding.problem ?? '',
           ...finding.fix === undefined ? {} : { fix: finding.fix },
         })),
-        review: renderReview(review),
+        scope,
+        round,
+        review: renderReview(review, { round, cost: result.cost, scope }),
+        ...result.cost === undefined ? {} : { cost: result.cost },
       }
     },
   })
 
   ctx.tools.register({
     name: 'agy_models',
-    description: 'List the models the local Antigravity CLI accepts, so the user can choose one together with its reasoning effort.',
+    description: 'List the models the local Antigravity CLI accepts together with the active default routes, so the user can choose one and its reasoning effort.',
     parameters: objectSchema({}),
     output: {
       schema: objectSchema({
         models: { type: 'array', items: { type: 'string' } },
         efforts: { type: 'array', items: { type: 'string' } },
-      }, ['models', 'efforts']),
-      render: (_args, value) => text(`Models:\n${value.models.join('\n')}\n\nReasoning efforts: ${value.efforts.join(', ')}`),
+        defaults: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            plan: { type: 'string' },
+            consult: { type: 'string' },
+            review: { type: 'string' },
+          },
+          required: ['plan', 'consult', 'review'],
+        },
+      }, ['models', 'efforts', 'defaults']),
+      render: (_args, value) => text(
+        `Models:\n${value.models.join('\n')}\n\nReasoning efforts: ${value.efforts.join(', ')}\n\nConfigured defaults:\n  plan: ${value.defaults.plan}\n  consult: ${value.defaults.consult}\n  review: ${value.defaults.review}`,
+      ),
     },
     async execute(_args, exec) {
-      const executable = await ctx.subprocess.resolveExecutable(command, undefined, exec.signal)
-      const handle = ctx.subprocess.spawn({
-        argv: [executable, 'models'],
-        cwd: homedir(),
-        stdio: { stdin: 'ignore', stdout: { maxBytes: 256 * 1024 }, stderr: { maxBytes: 64 * 1024 } },
-        graceMs: 3000,
-        signal: exec.signal,
-      })
-      const { exitCode } = await handle.done
+      const { exitCode, stdout, stderr } = await runCommand([command, 'models'], homedir(), exec.signal, 256 * 1024)
       if (exitCode !== 0) {
-        throw new Error(`agy models exited with code ${exitCode}: ${summarise(textOf(handle.collected.stderr), 2000)}`)
+        const hint = authHint(stderr)
+        throw new Error(`agy models exited with code ${exitCode}${hint === undefined ? '' : `. ${hint}`}: ${summarise(stderr, 2000)}`)
       }
-      const models = textOf(handle.collected.stdout)
+      const models = stdout
         .split('\n')
         .map(line => line.split('\t')[0].trim())
         .filter(line => line.length > 0)
-      return { models, efforts: [...AGY_EFFORTS] }
+      const rootId = exec.agent === undefined ? undefined : rootIdOf(exec.agent)
+      const fmt = (tier) => `${tier.model ?? '(cli default)'} / ${tier.effort ?? '(model default)'}`
+      const defaults = {
+        plan: fmt(resolveTierRoute(rootId, 'plan')),
+        consult: fmt(resolveTierRoute(rootId, 'consult')),
+        review: fmt(resolveTierRoute(rootId, 'review')),
+      }
+      return { models, efforts: [...AGY_EFFORTS], defaults }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'agy_routes',
+    description: 'Record the user\'s chosen agy model and reasoning effort for this task (planning, quick consult, and review), so every later call and subagent inherits them automatically instead of relying on memory.',
+    parameters: objectSchema({
+      planModel: { type: 'string', description: 'Model id for planning (and review fallback if reviewModel is omitted).' },
+      planEffort: { type: 'string', enum: AGY_EFFORTS, description: 'Reasoning effort for planning (and review fallback).' },
+      consultModel: { type: 'string', description: 'Model id for quick lookups (`mode: quick`). Omit to keep the cheap consult default.' },
+      consultEffort: { type: 'string', enum: AGY_EFFORTS, description: 'Reasoning effort for quick lookups.' },
+      reviewModel: { type: 'string', description: 'Model id for `agy_review`. Omit to inherit planModel.' },
+      reviewEffort: { type: 'string', enum: AGY_EFFORTS, description: 'Reasoning effort for `agy_review`. Omit to inherit planEffort.' },
+    }),
+    output: {
+      schema: objectSchema({
+        plan: { type: 'string' },
+        consult: { type: 'string' },
+        review: { type: 'string' },
+      }, ['plan', 'consult', 'review']),
+      render: (_args, value) => text(`Active agy routes for this task:\n  plan: ${value.plan}\n  consult: ${value.consult}\n  review: ${value.review}`),
+    },
+    async execute(args, exec) {
+      if (exec.agent === undefined) throw new Error('agy_routes needs a calling agent')
+      for (const key of ['planEffort', 'consultEffort', 'reviewEffort']) {
+        if (args[key] !== undefined && !AGY_EFFORTS.includes(args[key])) {
+          throw new Error(`unknown reasoning effort ${JSON.stringify(args[key])}; use one of ${AGY_EFFORTS.join(', ')}`)
+        }
+      }
+      const rootId = rootIdOf(exec.agent)
+      const prev = routes.get(rootId) ?? {}
+      const next = {
+        plan: {
+          model: args.planModel ?? prev.plan?.model,
+          effort: args.planEffort ?? prev.plan?.effort,
+        },
+        consult: {
+          model: args.consultModel ?? prev.consult?.model,
+          effort: args.consultEffort ?? prev.consult?.effort,
+        },
+        review: {
+          model: args.reviewModel ?? prev.review?.model,
+          effort: args.reviewEffort ?? prev.review?.effort,
+        },
+      }
+      boundedSet(routes, rootId, next)
+      const fmt = (tier) => {
+        const resolved = reconcileEffort(tier.model, tier.effort)
+        return `${resolved.model ?? '(cli default)'} / ${resolved.effort ?? resolved.implied ?? '(model default)'}`
+      }
+      return {
+        plan: fmt(resolveTierRoute(rootId, 'plan')),
+        consult: fmt(resolveTierRoute(rootId, 'consult')),
+        review: fmt(resolveTierRoute(rootId, 'review')),
+      }
     },
   })
 
@@ -577,7 +1338,7 @@ export function apply(ctx, config = {}) {
       const maxDepth = Math.max(0, Math.trunc(args.maxDepth))
       const allow = Boolean(args.allow) && maxChildren > 0 && maxDepth > 0
       const budget = { allow, maxChildren, maxDepth }
-      budgets.set(rootIdOf(exec.agent), budget)
+      boundedSet(budgets, rootIdOf(exec.agent), budget)
       return budget
     },
   })

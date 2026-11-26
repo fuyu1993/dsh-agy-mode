@@ -3,6 +3,16 @@
 What was actually run against the `agy` on this machine (`agy` 1.5.17,
 `~/.local/antigravity/bin/agy`), and what remains unverified.
 
+## Automated tests
+
+Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/fuyu/CodeProjects/dsh-agy-mode/test/index.test.js), which verifies:
+
+- Pure helpers: `reconcileEffort`, `resolveVerdict` (including empty `fail` locking the gate), `parsePorcelainStatus`, `prioritizeAndClipDiff` (source files prioritized ahead of lockfiles), `renderReview`, `authHint`, `transientHint`, `summarise`, and `boundedSet`.
+- Delegation guard across all budget branches and `agy_routes` inheritance across child sessions and tiers.
+- Review gate across root and subagent edits, empty-`fail` locking, `stalled` re-arming on new edits, and shell-only fingerprint verification against real temporary git repositories.
+- `collectDiff` inclusion of untracked text files, binary skipping, and `baseHead..HEAD` mid-task commit diffs.
+- `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
+
 ## Verified
 
 ### Composition
@@ -59,6 +69,51 @@ verdict string alone.
 - A **failed** mutating call does not mark the session dirty, so an error does
   not demand a review.
 
+### A failing review keeps the gate shut (0.3.0)
+
+- `agy_review` returning `fail` leaves the gate closed: the next close steers
+  with "agy still rejects this work" and names the outstanding findings.
+- A `fail` carrying **no** findings also locks the gate, treated as one major.
+- After `maxReviewRounds` consecutive failures the steering text changes to
+  "stop looping, report the disagreement", and the following close is silent —
+  the loop stops instead of burning calls.
+- A later `pass` (even with minor notes) clears everything: no steering.
+
+### Cost work (0.3.0)
+
+Measured on this machine with `agy` 1.5.17:
+
+- **Conversation reuse works.** Seeding a fact in one call and asking for it in
+  the next, the second call carried `--conversation <id>` and answered the fact
+  back correctly. Without reuse the same follow-up is a cold start.
+- **One conversation per task.** A `plan` call followed by a `quick` call now
+  resumes the same conversation; earlier they were keyed separately and both
+  cold-started.
+- **Tiers route independently.** With `planModel: gemini-4-hydrogen` /
+  `planEffort: high` and `consultModel: gemini-3.8-flash` / `consultEffort:
+  low`, the two calls spawned with exactly those argv pairs.
+- **Diff scope.** With a real working-tree change, `agy_review` reported
+  `scope: diff`, judged the actual diff, and passed with no `work` argument
+  given. Against a directory that is not a git repo it falls back to `repo` and
+  demands a description instead of reviewing nothing.
+- **Cost accounting.** `agy`'s usage has `total = input + output`, so
+  `cache_read_tokens` is a **subset** of `input_tokens` and the two must not be
+  added. The first version did add them and printed `161% cached`; the ratio is
+  now capped at 100 and the totals are correct (verified: 24.7k in / 36% cached
+  over two calls).
+
+### Model ids carry their own effort
+
+`agy` rejects `--model gemini-3.8-flash-low --effort high` as a conflict:
+
+```
+error: invalid model selection (--model "gemini-3.8-flash-low" --effort "high")
+```
+
+The plugin now reconciles the two: a model id ending in an effort suffix wins
+and `--effort` is omitted; an unsuffixed id takes the effort. Both paths were
+verified by inspecting the spawned argv.
+
 ### CLI behaviour relied on
 
 - `agy` in `--mode plan` cannot create files even with
@@ -81,6 +136,12 @@ verdict string alone.
   descendant count then reports 0, so `maxChildren` cannot be exceeded by that
   path. The depth limit and the `allow` flag still apply.
 - Behaviour against `agy` versions other than 1.5.17.
+- Trimming `agy`'s own tool set. It ships 60 tools per call (16 of them
+  browser automation) that a coding task never uses. `--settings` exists but
+  rejects `agents`, `tools` and unknown keys alike, so the accepted key names
+  are still unknown.
+- Whether concurrent `agy` calls share the prompt cache. Three parallel calls
+  did each report ~8.7k cached tokens, but that is one observation, not a rule.
 
 ## After publishing
 
