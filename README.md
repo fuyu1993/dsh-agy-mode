@@ -49,16 +49,11 @@
 
 ## 模式名与语言
 
-模式名和描述跟随界面语言：中文界面显示 **Antigravity 规划模式**，英文界面显示 **Antigravity planner**。判定方式是读 `$DSH_HOME/desktop-locale.json`（或 `locale.json`），读不到就按中文。
+模式选择器里固定显示 **Antigravity planner**，描述也是一句英文，不随界面语言变化。
 
-需要强制指定，给宿主进程设环境变量：
+早期版本试过用 `!!js` 读界面语言动态换名，在 DSH 0.2.2-rc.5 上不成立：preset 这一行声明了 `EntryGroup`，而 loader 对这类行整块跳过 `!!js` 求值（它要等子插件各自激活才求值），但插件自己的 schema 又要求 `name` 是字符串，于是激活直接报 `expected string but got [object Object]`。所以这两项现在是字面量。
 
-```bash
-DSH_AGY_MODE_LANG=en dsh --profile <profile>   # 强制英文
-DSH_AGY_MODE_LANG=zh dsh --profile <profile>   # 强制中文
-```
-
-插件页里的标题与说明来自 `locale/zh.json` 与 `locale/en.json`，由 DSH 自己的本地化机制切换。
+插件页里的标题与说明不受影响，仍来自 `locale/zh.json` 与 `locale/en.json`，由 DSH 自己的本地化机制切换。
 
 ## 它和其它模式的区别
 

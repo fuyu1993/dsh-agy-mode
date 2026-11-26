@@ -22,23 +22,24 @@ mounted at Host level, so no other mode gains them.
 
 ## Mode name and language
 
-The preset's `name` and `description` are `!!js` expressions that read the
-interface language at load time and return the Chinese or English text:
+The preset's `name` and `description` are literal strings, fixed to English:
 
 ```yaml
-name: !!js "(() => { ... return lang.startsWith('en') ? \"Antigravity planner\" : \"Antigravity 规划模式\" })()"
+name: Antigravity planner
+description: Antigravity CLI plans, reviews and signs off on quality; ...
 ```
 
-Language resolution order:
+They cannot be `!!js`. `@deepseek-ai/dsh-agent-preset` sets
+`static [EntryGroup.key] = true` so child expressions are preserved for their
+own plugins, and the loader therefore skips `interpolate` over this row's whole
+config (`loader/lib/index.js`, the `internal/config` hook). The plugin's own
+Config still requires `name: z.string()`, so an expression reaches schemastery
+as `{ __jsExpr }` and activation fails with `$.name expected string but got
+[object Object]`. An earlier revision read the interface language this way and
+broke on 0.2.2-rc.5.
 
-1. `DSH_AGY_MODE_LANG` (`en` → English, anything else → Chinese),
-2. `$DSH_HOME/locale.json` → `language`,
-3. `$DSH_HOME/desktop-locale.json` → `desktop` (this profile writes `zh`),
-4. fallback: Chinese.
-
-The expressions use only `process` globals, so they evaluate in the loader's
-empty scope and never depend on a service being available yet. `locale/zh.json`
-and `locale/en.json` carry the plugin-page title and description, which follow
+`locale/zh.json` and `locale/en.json` still carry the plugin-page title and
+description, which follow
 DSH's own locale mechanism.
 
 ## The start-of-task conversation

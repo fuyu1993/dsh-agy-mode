@@ -19,10 +19,14 @@ Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/
 
 - `dsh --profile <copy of desktop> --dump-config` composes `preset-agy` with 24
   child rows: the 23 Standard rows plus `agy-planner`.
-- The mode name resolves both ways with the loader's own evaluation
-  (`with (ctx) eval(expr)` against an empty scope): `Antigravity 规划模式` in
-  Chinese, `Antigravity planner` in English. `DSH_AGY_MODE_LANG=en` overrides,
-  and a missing locale file falls back to Chinese.
+- The mode name is a literal string. An earlier revision resolved it from the
+  interface language with a `!!js` expression; that fails on 0.2.2-rc.5 with
+  `$.name expected string but got [object Object]`, because a preset row
+  declares `EntryGroup` and the loader skips `interpolate` for its config while
+  the plugin's own schema still requires a string. Verified fixed by parsing
+  `cordis.patch.yml` with the loader's `!!js` tag and validating the row
+  against the real `Config`: `name`/`description` are strings, `plugins` keeps
+  its 4 child `!!js` expressions, and the row validates with 24 child rows.
 - The bundle parses as YAML with the loader's `!!js` tag, and the profile's own
   patch still parses.
 
