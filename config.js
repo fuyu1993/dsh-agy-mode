@@ -17,11 +17,17 @@
  * The browser cannot spawn the CLI, and the tool that can (`agy_models`) lives
  * inside the preset, so the page reads the catalog from this row instead.
  *
+ * Everything testable lives in `config-model.js` (pure helpers) and
+ * `config-runtime.js` (mount behaviour); this file is the schema plus the call
+ * that connects them. The split is not cosmetic: a row whose mount code cannot
+ * be reached by `npm test` is a row that ships bugs.
+ *
  * @module dsh-agy-mode/config
  */
 
 import z from '@deepseek-ai/schemastery'
-import { AGY_EFFORTS, TIERS, createReader, parseModelCatalog, unwrap } from './config-model.js'
+import { AGY_EFFORTS, createReader } from './config-model.js'
+import { mountConfig } from './config-runtime.js'
 
 // Re-exported so the Host row and its tests share one definition.
 export { AGY_EFFORTS, TIERS, createReader, parseModelCatalog, readTier } from './config-model.js'
@@ -30,25 +36,6 @@ export const name = 'agy-planner-config'
 
 /** Required only to list the models; the row still loads without it. */
 export const inject = ['subprocess']
-
-/** Profile entry id; also the settings namespace the page reads. */
-const ENTRY_ID = 'agy-planner-config'
-
-/** Deadline for one `agy models` probe. */
-const MODEL_PROBE_TIMEOUT_MS = 20_000
-
-/** One settings write recomposes the profile, so retry briefly before giving up. */
-const PUBLISH_ATTEMPTS = 4
-
-/** Delay between publish attempts, multiplied by the attempt number. */
-const PUBLISH_RETRY_MS = 120
-
-/**
- * How long to wait for the settings service to serve this entry before the
- * first publish attempt. The service projects entries only once the Loader has
- * settled every row, which is after this `apply` returns.
- */
-const PUBLISH_DELAY_MS = 400
 
 /**
  * One reasoning effort, plus the empty choice.
@@ -93,134 +80,9 @@ export const Config = z.object({
 /**
  * Mount the configuration row.
  *
- * The reader is installed on the Host context (`ctx.set`) because the
- * preset-child row resolves it through `ctx.get`, and a child realm inherits
- * the Host root's services. No `settings.configure({ auto: false })` is needed:
- * no shipped client builds a form from a schema, so the page is the one this
- * bundle's `client.js` registers into `plugins.bundle.config`.
- *
  * @param ctx - the plugin context.
  * @param config - this row's config.
  */
 export function apply(ctx, config = {}) {
-  const reader = createReader(config)
-  ctx.set('agyModeDefaults', reader)
-  ctx.effect(() => () => {
-    // Only clear if this row still owns the name (a reloaded row replaces it).
-    if (ctx.get('agyModeDefaults') === reader) ctx.set('agyModeDefaults', undefined)
-  }, 'agy-mode.defaults')
-
-  /** The settings service, captured from the context that declared it. */
-  let settingsService
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsService = settingsCtx.get('settings')
-  })
-
-  let disposed = false
-  ctx.effect(() => () => { disposed = true }, 'agy-mode.dispose')
-
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
-  /**
-   * Write one field into this entry.
-   *
-   * A refused write is retried briefly rather than dropped: the page may have
-   * edited the entry between the read and the write, and a silent failure looks
-   * exactly like a working control with nothing to show.
-   * @param field - config field name.
-   * @param value - the string to store.
-   */
-  const publish = async (field, value) => {
-    for (let attempt = 0; attempt < PUBLISH_ATTEMPTS; attempt += 1) {
-      if (disposed) return false
-      const settings = settingsService ?? ctx.get('settings')
-      if (settings === undefined || typeof settings.update !== 'function'
-        || typeof settings.describe !== 'function' || settings.writable !== true) {
-        await sleep(PUBLISH_RETRY_MS * (attempt + 1))
-        continue
-      }
-      let row
-      try {
-        row = settings.describe().find(candidate => candidate.ns === ENTRY_ID)
-      } catch {
-        await sleep(PUBLISH_RETRY_MS * (attempt + 1))
-        continue
-      }
-      if (row === undefined) {
-        await sleep(PUBLISH_RETRY_MS * (attempt + 1))
-        continue
-      }
-      if (row.value !== undefined && row.value[field] === value) return true
-      try {
-        await settings.update(ENTRY_ID, { [field]: value }, row.revision)
-        return true
-      } catch {
-        await sleep(PUBLISH_RETRY_MS * (attempt + 1))
-      }
-    }
-    return false
-  }
-
-  /**
-   * Run `agy models` once and store the ids.
-   *
-   * Failure is silent by design: the page simply keeps showing no catalog and
-   * the user can still type an id, which is the same state a fresh install is
-   * in. Raising here would take the whole configuration row down over a
-   * convenience control.
-   */
-  const probeModels = async () => {
-    const subprocess = ctx.get('subprocess')
-    if (subprocess === undefined) return
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), MODEL_PROBE_TIMEOUT_MS)
-    try {
-      const executable = await subprocess.resolveExecutable('agy', undefined, controller.signal)
-      const handle = subprocess.spawn({
-        argv: [executable, 'models'],
-        cwd: process.cwd(),
-        stdio: {
-          stdin: 'ignore',
-          stdout: { maxBytes: 256 * 1024 },
-          stderr: { maxBytes: 64 * 1024 },
-        },
-        graceMs: 5000,
-        signal: controller.signal,
-      })
-      const { exitCode } = await handle.done
-      if (exitCode !== 0) return
-      const models = parseModelCatalog(handle.collected.stdout?.readFrom(0)?.text)
-      if (models.length === 0) return
-      await publish('modelCatalog', models.join('\n'))
-      await publish('modelCatalogAt', new Date().toISOString())
-    } catch {
-      // A missing or signed-out CLI leaves the catalog empty.
-    } finally {
-      clearTimeout(timer)
-    }
-  }
-
-  // One probe per plugin load, so the very first visit to the page already has
-  // a catalog. The settings service answers only after the Loader settles, so
-  // the first publish attempt has to wait for it.
-  const startup = setTimeout(() => { probeModels().catch(() => {}) }, PUBLISH_DELAY_MS)
-  ctx.effect(() => () => clearTimeout(startup), 'agy-mode.model-probe')
-
-  // The page's refresh control bumps `modelProbeNonce`; poll the reference for
-  // a change, because a volatile field notifies nobody.
-  let lastNonce = unwrap(config.modelProbeNonce) ?? ''
-  let inflight = false
-  const poll = setInterval(async () => {
-    if (disposed || inflight) return
-    const nonce = unwrap(config.modelProbeNonce) ?? ''
-    if (nonce === lastNonce) return
-    lastNonce = nonce
-    inflight = true
-    try {
-      await probeModels()
-    } finally {
-      inflight = false
-    }
-  }, 1000)
-  ctx.effect(() => () => clearInterval(poll), 'agy-mode.model-probe-watch')
+  mountConfig(ctx, config, { reader: createReader(config) })
 }

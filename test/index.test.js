@@ -935,3 +935,143 @@ test('a plugin-page choice reaches the agy argv for every tier', async () => {
   const reviewArgv = argvSeen.at(-1)
   assert.equal(reviewArgv.includes('--model'), false, 'review must not send --model')
 })
+
+// --- the configuration row's mount behaviour ---
+
+/**
+ * A Cordis-like context that enforces the real `set`/`provide` contract.
+ *
+ * `set` throwing unless the name was provided is not a detail worth trusting a
+ * stub to be lenient about: the shipped 0.4.0 called `set` on an undeclared name
+ * and every plugin page failed with `cannot set property "agyModeDefaults"
+ * without provide`. This stub reproduces that rule so the bug cannot return.
+ */
+function makeMountCtx({ settings, subprocess, provided = new Map() } = {}) {
+  const cleanups = []
+  const services = new Map(provided)
+  if (settings !== undefined) services.set('settings', settings)
+  if (subprocess !== undefined) services.set('subprocess', subprocess)
+  return {
+    services,
+    cleanups,
+    ctx: {
+      provide(name, value) {
+        if (services.has(name)) throw new Error(`service "${name}" has been registered already`)
+        services.set(name, value)
+        return () => services.delete(name)
+      },
+      set(name, value) {
+        if (!services.has(name)) throw new Error(`cannot set property "${name}" without provide`)
+        services.set(name, value)
+        return true
+      },
+      get(name) { return services.get(name) },
+      effect(factory) {
+        const cleanup = factory()
+        if (typeof cleanup === 'function') cleanups.push(cleanup)
+        return cleanup
+      },
+      inject(deps, callback) { callback(this) },
+    },
+  }
+}
+
+test('the configuration row provides its reader instead of setting it', async () => {
+  const { mountConfig, DEFAULTS_SERVICE } = await import('../config-runtime.js')
+
+  const reader = tier => (tier === 'plan' ? { present: true, model: 'from-page' } : { present: true })
+  const { ctx, services } = makeMountCtx()
+  // No timers in this test: the probe and the poll are replaced by no-ops.
+  mountConfig(ctx, {}, {
+    reader,
+    schedule: () => 0,
+    repeat: () => 0,
+    cancel: () => {},
+  })
+
+  // The preset-child row reads this through `ctx.get`, which needs no inject.
+  assert.equal(services.get(DEFAULTS_SERVICE), reader)
+  assert.deepEqual(services.get(DEFAULTS_SERVICE)('plan'), { present: true, model: 'from-page' })
+})
+
+test('the configuration row publishes the model catalog from agy models', async () => {
+  const { mountConfig } = await import('../config-runtime.js')
+
+  const writes = []
+  let revision = 1
+  const settings = {
+    writable: true,
+    describe: () => [{ ns: 'agy-planner-config', revision, value: {} }],
+    async update(ns, patch) {
+      writes.push({ ns, ...patch })
+      revision += 1
+    },
+  }
+  const subprocess = {
+    async resolveExecutable(cmd) { return cmd },
+    spawn(opts) {
+      assert.deepEqual(opts.argv.slice(1), ['models'])
+      return {
+        done: Promise.resolve({ exitCode: 0 }),
+        collected: { stdout: { readFrom: () => ({ text: 'gemini-4-hydrogen-high\tHydrogen\nclaude-opus-5-5-high\tOpus\n' }) } },
+      }
+    },
+  }
+
+  const { ctx } = makeMountCtx({ settings, subprocess })
+  const runtime = mountConfig(ctx, {}, {
+    reader: () => ({}),
+    schedule: () => 0,
+    repeat: () => 0,
+    cancel: () => {},
+    now: () => '2026-11-26T00:00:00.000Z',
+  })
+
+  assert.equal(await runtime.probeModels(), true)
+  const catalog = writes.find(write => write.modelCatalog !== undefined)
+  assert.equal(catalog.modelCatalog, 'gemini-4-hydrogen-high\nclaude-opus-5-5-high')
+  assert.equal(writes.find(write => write.modelCatalogAt !== undefined)?.modelCatalogAt, '2026-11-26T00:00:00.000Z')
+})
+
+test('a missing or signed-out agy leaves the catalog alone instead of throwing', async () => {
+  const { mountConfig } = await import('../config-runtime.js')
+  const writes = []
+  const settings = {
+    writable: true,
+    describe: () => [{ ns: 'agy-planner-config', revision: 1, value: {} }],
+    async update(ns, patch) { writes.push(patch) },
+  }
+  let mode = 'no-subprocess'
+  const subprocess = {
+    async resolveExecutable() { if (mode === 'missing-cli') throw new Error('ENOENT'); return 'agy' },
+    spawn() {
+      return { done: Promise.resolve({ exitCode: 1 }), collected: { stdout: { readFrom: () => ({ text: '' }) } } }
+    },
+  }
+
+  const first = makeMountCtx({ settings })
+  const a = mountConfig(first.ctx, {}, { reader: () => ({}), schedule: () => 0, repeat: () => 0, cancel: () => {} })
+  assert.equal(await a.probeModels(), false)
+
+  mode = 'missing-cli'
+  const second = makeMountCtx({ settings, subprocess })
+  const b = mountConfig(second.ctx, {}, { reader: () => ({}), schedule: () => 0, repeat: () => 0, cancel: () => {} })
+  assert.equal(await b.probeModels(), false)
+
+  // A non-zero exit is a signed-out CLI: no ids, and no write attempted.
+  mode = 'signed-out'
+  const third = makeMountCtx({ settings, subprocess })
+  const c = mountConfig(third.ctx, {}, { reader: () => ({}), schedule: () => 0, repeat: () => 0, cancel: () => {} })
+  assert.equal(await c.probeModels(), false)
+  assert.deepEqual(writes, [])
+})
+
+test('unloading the configuration row removes the reader', async () => {
+  const { mountConfig, DEFAULTS_SERVICE } = await import('../config-runtime.js')
+  const { ctx, services, cleanups } = makeMountCtx()
+  mountConfig(ctx, {}, { reader: () => ({}), schedule: () => 0, repeat: () => 0, cancel: () => {} })
+  assert.equal(services.has(DEFAULTS_SERVICE), true)
+  // The provider's own disposer is what Cordis runs on unload; the mount also
+  // registers cleanup for its timers, which must not throw.
+  for (const cleanup of cleanups) cleanup()
+})

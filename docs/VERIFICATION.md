@@ -13,7 +13,23 @@ Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/
 - `collectDiff` inclusion of untracked text files, binary skipping, and `baseHead..HEAD` mid-task commit diffs.
 - `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
 
-22 tests in total as of 0.4.0.
+26 tests in total as of 0.4.1.
+
+### 0.4.1
+
+- **The configuration row could not be mounted at all.** 0.4.0 published its
+  reader with `ctx.set('agyModeDefaults', …)`, which Cordis rejects with
+  `cannot set property "agyModeDefaults" without provide` — a fiber may only
+  assign a name it has declared. Every plugin page failed to load the row.
+  Fixed by using `ctx.provide`, which declares the service and registers its
+  own disposer.
+- The mount code moved to `config-runtime.js` so `npm test` can reach it: it
+  lived in `config.js`, which imports `@deepseek-ai/schemastery` and therefore
+  cannot be loaded from this checkout. That is why 0.4.0 shipped the bug with a
+  green suite.
+- Four tests now cover it. Their stub enforces the real contract — `set` throws
+  unless the name was provided — and reverting the fix to `ctx.set` reproduces
+  the exact production error in four tests, so the rule cannot silently regress.
 
 ### 0.4.0
 
