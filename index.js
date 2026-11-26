@@ -20,16 +20,18 @@
  *   - Diff first. Sending the working-tree diff costs about the same as letting
  *     agy rediscover it, but the diff is ground truth instead of a guess.
  *
- * Tools are registered as plain definitions with raw JSON Schemas, so the
- * bundle imports nothing from DSH packages and needs no dependency of its own.
+ * Tools are registered as plain definitions with raw JSON Schemas, so this
+ * module imports nothing from DSH packages and needs no dependency of its own.
+ * The one DSH package this bundle touches is `@deepseek-ai/schemastery`, and
+ * only from `config.js` (the Host-level settings row), never from here.
  *
  * @module dsh-agy-mode
  */
 
 import { homedir, tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, stat, unlink } from 'node:fs/promises'
-import { join, resolve, sep } from 'node:path'
+import { readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export const name = 'agy-planner'
 // Required services only; everything else is read through ctx.get() so the
@@ -59,6 +61,28 @@ const LOW_PRIORITY_DIFF_RE = /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn
 
 /** Maximum tracked task roots per in-memory map to bound long-running processes. */
 const MAX_TRACKED_ROOTS = 200
+
+/**
+ * Untracked paths never worth spending review budget on. These are editor and
+ * tool state directories, not deliverables: agy reading them costs tokens and
+ * tells it nothing about the change under review.
+ */
+const UNTRACKED_NOISE_RE = /(?:^|\/)(?:\.idea|\.vscode|\.openidea|\.fleet|\.DS_Store|node_modules|coverage|\.nyc_output|dist|build|out|target|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.turbo|\.parcel-cache|\.next|\.nuxt)(?:\/|$)/i
+
+/**
+ * Byte ceiling for one argv string, per platform.
+ *
+ * Linux caps a single argument at MAX_ARG_STRLEN (131072 bytes), Windows at
+ * ~32k UTF-16 units for the whole command line, and macOS has no per-string
+ * limit at all (measured: 1,000,000 bytes passes, 1,200,000 fails with E2BIG).
+ * Truncation is measured in characters today, so a CJK diff can occupy three
+ * bytes per character and overflow a limit its character count says it fits.
+ */
+export const PROMPT_LIMIT_BYTES = process.platform === 'linux'
+  ? 120_000
+  : process.platform === 'win32'
+    ? 26_000
+    : 500_000
 
 /** Schema agy fills for one review, so the verdict is machine-readable. */
 const REVIEW_SCHEMA = {
@@ -136,6 +160,50 @@ export function summarise(text, limit = 24000) {
   return value.length > limit ? `${value.slice(0, limit)}\n…[truncated ${value.length - limit} chars]` : value
 }
 
+/**
+ * How many units one string occupies against a platform prompt budget.
+ *
+ * win32 counts UTF-16 code units (`CreateProcess` limit) while POSIX counts
+ * UTF-8 bytes. Mixing them up is what lets a CJK prompt pass a character check
+ * and then fail the spawn.
+ */
+export function promptUnits(text) {
+  return process.platform === 'win32' ? text.length : Buffer.byteLength(text, 'utf8')
+}
+
+/**
+ * Clip text to a budget measured in `promptUnits`, without splitting a
+ * surrogate pair or a multi-byte character in half.
+ * @param text - the text to clip.
+ * @param limit - maximum units to keep.
+ * @param note - appended when clipping happened; `{n}` receives the dropped count.
+ */
+export function clipToUnits(text, limit, note = '…[truncated {n}]') {
+  if (limit <= 0) return ''
+  if (promptUnits(text) <= limit) return text
+  const suffix = note.replace('{n}', String(promptUnits(text) - limit))
+  const budget = Math.max(0, limit - promptUnits(suffix))
+
+  if (process.platform === 'win32') {
+    let cut = Math.min(budget, text.length)
+    // Never leave a lone high surrogate at the boundary.
+    const code = text.charCodeAt(cut - 1)
+    if (cut > 0 && code >= 0xd800 && code <= 0xdbff) cut -= 1
+    return `${text.slice(0, cut)}${suffix}`
+  }
+
+  // Walk whole code points so the cut lands on a UTF-8 boundary.
+  let used = 0
+  let cut = 0
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8')
+    if (used + size > budget) break
+    used += size
+    cut += char.length
+  }
+  return `${text.slice(0, cut)}${suffix}`
+}
+
 /** The launcher reports a signed-out CLI only on stderr; surface it as advice. */
 export function authHint(stderr) {
   return /not logged into Antigravity/i.test(stderr)
@@ -186,6 +254,18 @@ export function parsePorcelainStatus(stdout) {
   return { files, untracked }
 }
 
+/**
+ * The path out of one trimmed porcelain display line.
+ *
+ * `parsePorcelainStatus` trims each line (`M  src/a.js` → `M src/a.js`), so the
+ * status columns are no longer fixed-width. The path starts after the last
+ * whitespace in the leading status run, which is either one or two characters.
+ * @param line - one trimmed porcelain line.
+ */
+function porcelainPath(line) {
+  return unquoteGitPath(line.replace(/^[ MADRCU?!]{1,2}\s+/, ''))
+}
+
 /** Extract the `b/...` path from a `diff --git` chunk header. */
 function diffChunkPath(chunk) {
   const firstLine = chunk.split(/\r?\n/, 1)[0] ?? ''
@@ -194,17 +274,20 @@ function diffChunkPath(chunk) {
 }
 
 /**
- * Clip a unified diff to `maxChars`, keeping source files ahead of lockfiles
+ * Clip a unified diff to a budget, keeping source files ahead of lockfiles
  * and generated bundles so noise does not crowd out real code changes.
+ * @param diffText - the unified diff.
+ * @param maxUnits - budget in `measure` units.
+ * @param measure - unit counter; defaults to `promptUnits`.
  */
-export function prioritizeAndClipDiff(diffText, maxChars) {
-  if (diffText.length <= maxChars) return { diff: diffText, omittedFiles: [] }
+export function prioritizeAndClipDiff(diffText, maxUnits, measure = promptUnits) {
+  if (measure(diffText) <= maxUnits) return { diff: diffText, omittedFiles: [] }
 
   const chunks = diffText.split(/^(?=diff --git )/m).filter(chunk => chunk.length > 0)
   if (chunks.length <= 1) {
     const omitted = chunks.length === 1 ? [diffChunkPath(chunks[0])].filter(Boolean) : []
     return {
-      diff: `${diffText.slice(0, maxChars)}\n…[diff truncated at ${maxChars} chars; ${diffText.length - maxChars} omitted]`,
+      diff: clipToUnits(diffText, maxUnits, `\n…[diff truncated at ${maxUnits} units; {n} omitted]`),
       omittedFiles: omitted,
     }
   }
@@ -221,16 +304,17 @@ export function prioritizeAndClipDiff(diffText, maxChars) {
   const omittedFiles = []
   let used = 0
   const reserve = 256
-  const limit = Math.max(0, maxChars - reserve)
+  const limit = Math.max(0, maxUnits - reserve)
 
   for (const item of [...primary, ...secondary]) {
-    if (used + item.chunk.length <= limit) {
+    const size = measure(item.chunk)
+    if (used + size <= limit) {
       kept.push(item.chunk)
-      used += item.chunk.length
+      used += size
       continue
     }
     if (kept.length === 0 && limit > 0) {
-      kept.push(`${item.chunk.slice(0, limit)}\n…[file diff truncated]`)
+      kept.push(clipToUnits(item.chunk, limit, '\n…[file diff truncated]'))
       used = limit
     }
     if (item.file !== undefined) omittedFiles.push(item.file)
@@ -238,21 +322,38 @@ export function prioritizeAndClipDiff(diffText, maxChars) {
 
   const suffix = omittedFiles.length === 0
     ? ''
-    : `\n…[diff truncated at ${maxChars} chars; omitted/clipped files: ${omittedFiles.join(', ')}]`
+    : `\n…[diff truncated at ${maxUnits} units; omitted/clipped files: ${omittedFiles.join(', ')}]`
   return { diff: `${kept.join('')}${suffix}`, omittedFiles }
 }
 
-/** Format untracked non-binary text files into synthetic diff blocks within `budgetChars`. */
-async function collectUntrackedDiffs(cwd, untracked, budgetChars) {
-  if (untracked.length === 0 || budgetChars <= 256) {
-    return { text: '', omitted: [...untracked] }
+/**
+ * Whether an untracked path is editor/tool state rather than a deliverable.
+ * @param relPath - repository-relative path.
+ */
+export function isUntrackedNoise(relPath) {
+  return UNTRACKED_NOISE_RE.test(relPath)
+}
+
+/**
+ * Format untracked non-binary text files into synthetic diff blocks within a
+ * unit budget. Editor state directories are skipped before they consume any.
+ * @param cwd - repository root.
+ * @param untracked - repository-relative untracked paths.
+ * @param budgetUnits - budget in `promptUnits`.
+ * @param measure - unit counter; defaults to `promptUnits`.
+ */
+async function collectUntrackedDiffs(cwd, untracked, budgetUnits, measure = promptUnits) {
+  const wanted = untracked.filter(path => !isUntrackedNoise(path))
+  const noisy = untracked.filter(path => isUntrackedNoise(path))
+  if (wanted.length === 0 || budgetUnits <= 256) {
+    return { text: '', omitted: [...wanted], skippedNoise: noisy.length }
   }
   const root = resolve(cwd)
   const blocks = []
   const omitted = []
-  let remaining = budgetChars
+  let remaining = budgetUnits
 
-  for (const relPath of untracked) {
+  for (const relPath of wanted) {
     const absPath = resolve(root, relPath)
     if (absPath !== root && !absPath.startsWith(`${root}${sep}`)) {
       omitted.push(relPath)
@@ -296,12 +397,12 @@ async function collectUntrackedDiffs(cwd, untracked, budgetChars) {
     const body = lines.map(line => `+${line}`).join('\n')
     const header = `diff --git a/${relPath} b/${relPath}\nnew file mode 100644\n--- /dev/null\n+++ b/${relPath}\n@@ -0,0 +1,${lines.length} @@\n`
     const fullBlock = `${header}${body}\n`
-    if (fullBlock.length <= remaining) {
+    if (measure(fullBlock) <= remaining) {
       blocks.push(fullBlock)
-      remaining -= fullBlock.length
-    } else if (blocks.length === 0 && remaining > header.length + 80) {
-      const sliceLen = remaining - header.length - 64
-      blocks.push(`${header}${body.slice(0, sliceLen)}\n…[new file truncated]\n`)
+      remaining -= measure(fullBlock)
+    } else if (blocks.length === 0 && remaining > measure(header) + 80) {
+      const sliceLen = remaining - measure(header) - 64
+      blocks.push(`${header}${clipToUnits(body, sliceLen, '\n…[new file truncated]')}\n`)
       remaining = 0
       omitted.push(`${relPath} (partial)`)
     } else {
@@ -309,7 +410,9 @@ async function collectUntrackedDiffs(cwd, untracked, budgetChars) {
     }
   }
 
-  return { text: blocks.join(''), omitted }
+  // Editor state is reported only as a count: naming those paths would put
+  // them back in front of agy, which is what skipping them avoided.
+  return { text: blocks.join(''), omitted, skippedNoise: noisy.length }
 }
 
 /** Render one review as model-facing text, strongest findings first. */
@@ -371,13 +474,24 @@ export function apply(ctx, config = {}) {
   const maxConversationTurns = config.maxConversationTurns ?? 12
   /** Consecutive failing reviews before the mode stops looping. */
   const maxReviewRounds = config.maxReviewRounds ?? 3
-  /** How much of the working-tree diff is sent to agy (bounded on win32 argv). */
-  const configuredDiffMaxChars = config.diffMaxChars ?? 48000
-  const diffMaxChars = process.platform === 'win32'
-    ? Math.min(configuredDiffMaxChars, 18000)
-    : configuredDiffMaxChars
-  /** Maximum total prompt characters passed on argv to avoid E2BIG / ENAMETOOLONG. */
-  const maxPromptChars = config.maxPromptChars ?? (process.platform === 'win32' ? 26000 : 96000)
+  /**
+   * Total prompt budget in `promptUnits` (bytes on POSIX, UTF-16 units on
+   * win32). `maxPromptBytes` is the honest name; `maxPromptChars` is still read
+   * so an existing row keeps its intent instead of reverting to the default.
+   */
+  const promptLimit = Math.min(
+    config.maxPromptBytes ?? config.maxPromptChars ?? PROMPT_LIMIT_BYTES,
+    PROMPT_LIMIT_BYTES,
+  )
+  /**
+   * Ceiling for the diff on its own. The review prompt is budgeted from the
+   * other end (see `agy_review`), so this only bounds `collectDiff` when it is
+   * called without an explicit budget.
+   */
+  const diffBudgetUnits = Math.min(
+    config.diffMaxBytes ?? config.diffMaxChars ?? 48_000,
+    promptLimit,
+  )
   /** Extra attempts for a transient gateway or throttle failure. */
   const retries = config.retries ?? 1
 
@@ -387,6 +501,18 @@ export function apply(ctx, config = {}) {
    * asks again.
    */
   const budgets = new Map()
+
+  /**
+   * Whether agy may be pointed outside the session workspace.
+   *
+   * agy runs with `--dangerously-skip-permissions` in read-only plan mode, so it
+   * can read any file it is pointed at and that content then travels to the
+   * model. The session's own filesystem policy does not travel with it, which
+   * makes an unvalidated `cwd` a way around the sandbox the user chose.
+   */
+  const allowExternalCwd = config.allowExternalCwd ?? false
+  /** Extra roots agy may be pointed at, besides the session workspace. */
+  const allowedRoots = Array.isArray(config.allowedRoots) ? config.allowedRoots.map(String) : []
 
   /**
    * User-chosen model/effort overrides per task root (`plan`, `consult`, `review`),
@@ -416,15 +542,19 @@ export function apply(ctx, config = {}) {
 
   /**
    * Per-task-root review gate state:
-   *   dirty             something changed since its last review
-   *   dirtyReason       'edit' (file tool) or 'shell' (shell/terminal tool)
-   *   unresolved        blocking findings the last review raised and nobody has cleared
-   *   rounds            consecutive failing reviews, so a stuck loop stays bounded
-   *   nudgedTurn        the turn already steered, so one turn is nudged once
-   *   stalled           the round cap was hit; stop steering until new edits happen
-   *   findings          findings from the last failing review for incremental re-check
-   *   cleanFingerprint  repo hash recorded when the last review passed
-   *   lastCwd           cwd of the last review, for shell-only fingerprint verification
+   *   dirtyCwds   Map<cwd, epoch> of directories holding unreviewed changes
+   *   epoch       monotonically increasing counter, bumped by every real change
+   *   unresolved  blocking findings the last review raised and nobody has cleared
+   *   rounds      consecutive failing reviews, so a stuck loop stays bounded
+   *   nudgedTurn  the turn already steered, so one turn is nudged once
+   *   stalled     the round cap was hit; stop steering until new edits happen
+   *   findings    findings from the last failing review for incremental re-check
+   *
+   * `dirtyCwds` replaced a single `dirty` flag because one gate serves a whole
+   * task root, and a task whose subagents work in two checkouts was clearing
+   * both at once when only one had been reviewed. The `epoch` is what makes a
+   * review's "pass" honest: a change that lands while the review is in flight
+   * bumps it, so the review's verdict no longer covers what is on disk.
    */
   const gates = new Map()
 
@@ -464,19 +594,31 @@ export function apply(ctx, config = {}) {
     let gate = gates.get(rootId)
     if (gate === undefined) {
       gate = {
-        dirty: false,
-        dirtyReason: undefined,
+        dirtyCwds: new Map(),
+        epoch: 0,
         unresolved: undefined,
         rounds: 0,
         nudgedTurn: undefined,
         stalled: false,
         findings: undefined,
-        cleanFingerprint: undefined,
-        lastCwd: undefined,
       }
       boundedSet(gates, rootId, gate)
     }
     return gate
+  }
+
+  /**
+   * Record that `cwd` now holds an unreviewed change.
+   *
+   * Bumping the epoch unconditionally is deliberate: a shell call that was not
+   * worth fingerprinting (because the gate already knew it was dirty) is still
+   * a call that could have touched a file, and a review running concurrently
+   * must not be credited with having seen it.
+   */
+  function markDirty(gate, cwd, reason) {
+    gate.epoch += 1
+    boundedSet(gate.dirtyCwds, cwd, { epoch: gate.epoch, reason })
+    gate.nudgedTurn = undefined
   }
 
   /** Every live Session below `rootId`, counted through the durable headers. */
@@ -593,9 +735,23 @@ export function apply(ctx, config = {}) {
       hash.update('\0')
       hash.update(diff.stdout)
 
+      // Without a HEAD commit `git diff` reports unstaged changes only, so a
+      // file staged in a fresh repository hashes identically before and after
+      // another edit-plus-stage. Fold the index in for that case.
+      if (head.exitCode !== 0) {
+        const staged = await runCommand(['git', '--no-pager', 'diff', '--cached'], cwd, signal, 4 * 1024 * 1024)
+        if (staged.exitCode === 0) {
+          hash.update('\0')
+          hash.update(staged.stdout)
+        }
+      }
+
       const { untracked } = parsePorcelainStatus(status.stdout)
       const root = resolve(cwd)
       for (const relPath of untracked.slice(0, 200)) {
+        // Editor state is excluded from the review diff, so it must not make
+        // the repository look changed either.
+        if (isUntrackedNoise(relPath)) continue
         const absPath = resolve(root, relPath)
         if (absPath !== root && !absPath.startsWith(`${root}${sep}`)) continue
         try {
@@ -624,6 +780,87 @@ export function apply(ctx, config = {}) {
       }
     }
     return session?.header.cwd ?? process.cwd()
+  }
+
+  /**
+   * Reject a `cwd` agy was pointed at that the session does not own.
+   *
+   * The comparison uses `realpath` on both sides and `path.relative` for
+   * containment: `realpath` collapses `/tmp` → `/private/tmp` on macOS (and
+   * any workspace symlink), while `relative` refuses `/repo-2` for `/repo`
+   * and catches a Windows drive change, which a `startsWith` test does not.
+   *
+   * @param requested - the directory agy was asked to explore.
+   * @param exec - the tool run context, for the caller's own workspace.
+   * @returns the canonical directory to pass to `agy`.
+   */
+  async function assertAllowedCwd(requested, exec) {
+    let target
+    try {
+      target = await realpath(requested)
+    } catch {
+      throw new Error(`cwd ${requested} does not exist or is not readable.`)
+    }
+    if (allowExternalCwd) return target
+
+    const session = exec?.agent?.session
+    const workingDirectory = ctx.get('workingDirectory')
+    let workspace
+    if (workingDirectory !== undefined && session !== undefined) {
+      try {
+        workspace = workingDirectory.get(session)
+      } catch {
+        // Fall through to the session header.
+      }
+    }
+    workspace ??= session?.header.cwd
+    if (workspace === undefined) return target
+
+    const roots = []
+    try {
+      roots.push(await realpath(workspace))
+    } catch {
+      roots.push(resolve(workspace))
+    }
+    for (const root of allowedRoots) {
+      try {
+        roots.push(await realpath(root))
+      } catch {
+        // A configured root that does not exist must not disable the rest.
+      }
+    }
+
+    const inside = roots.some((root) => {
+      const rel = relative(root, target)
+      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+    })
+    if (!inside) {
+      throw new Error(
+        `cwd ${requested} is outside the session workspace ${workspace}. `
+        + 'Pass a directory inside it, or set `allowExternalCwd: true` / add it to `allowedRoots` on the agy-planner row.',
+      )
+    }
+    return target
+  }
+
+  /**
+   * The canonical form of a directory, for use as a map key.
+   *
+   * `dirtyCwds` and `baseHeads` are keyed by directory, and the same repository
+   * reaches them from two sides: a shell tool's cwd and an agy tool's `cwd`.
+   * Those strings differ for a symlinked checkout (`/tmp/x` versus
+   * `/private/tmp/x` on macOS), which would leave one side's entry invisible to
+   * the other. Resolving both collapses them into one entry.
+   * @param dir - the directory to canonicalize.
+   * @returns the resolved path, or the input when it cannot be resolved.
+   */
+  async function canonicalCwd(dir) {
+    if (dir === undefined) return dir
+    try {
+      return await realpath(dir)
+    } catch {
+      return resolve(dir)
+    }
   }
 
   // Enforce the user's answer on every delegated start. A guard is monotonic:
@@ -656,9 +893,30 @@ export function apply(ctx, config = {}) {
     const agent = execution.agent
     const rootId = agent === undefined ? undefined : rootIdOf(agent)
     const isMutating = MUTATING_TOOLS.has(execution.name)
+    // `agy_review` is not itself a mutation, but it needs the same key to clear
+    // the directory its verdict covers, so it resolves one too.
+    const needsCwd = isMutating || execution.name === 'agy_review'
+    // One canonical directory for this call, used as the key for `baseHeads`
+    // and `dirtyCwds`. A symlinked checkout must land on one entry, whoever
+    // reopened it.
+    const callCwd = needsCwd ? await canonicalCwd(resolveCwd(execution.args, { agent })) : undefined
     if (isMutating && rootId !== undefined) {
-      const cwd = resolveCwd(execution.args, { agent })
-      await ensureBaseHead(rootId, cwd, execution.signal)
+      await ensureBaseHead(rootId, callCwd, execution.signal)
+    }
+
+    // Sample the repository before a shell call so its effect can be measured
+    // rather than assumed. Only read when the gate believes it is clean: an
+    // already-dirty task does not need the answer, and the check costs three
+    // git invocations.
+    const isShell = SHELL_TOOLS.has(execution.name)
+    // The epoch at the moment agy_review was entered. The diff is collected
+    // inside the tool, after this point, so any later bump is a change the
+    // review cannot have judged.
+    const reviewEpoch = execution.name === 'agy_review' && rootId !== undefined ? gateOf(rootId).epoch : undefined
+    const reviewCwd = callCwd
+    let before
+    if (isShell && agent !== undefined && rootId !== undefined && !gateOf(rootId).dirtyCwds.has(reviewCwd)) {
+      before = await repoFingerprint(reviewCwd, execution.signal)
     }
 
     const result = await next()
@@ -669,29 +927,50 @@ export function apply(ctx, config = {}) {
       const value = result.value ?? {}
       const findings = Array.isArray(value.findings) ? value.findings : []
       const blocking = findings.filter((finding) => BLOCKING.has(finding.severity))
-      gate.dirty = false
-      gate.dirtyReason = undefined
+      const reviewedCwd = callCwd
       gate.nudgedTurn = undefined
-      gate.lastCwd = resolveCwd(execution.args, { agent })
+
       if (value.verdict === 'pass') {
-        gate.unresolved = undefined
-        gate.rounds = 0
-        gate.stalled = false
-        gate.findings = undefined
+        // A pass only covers the state the review ran against. If anything
+        // landed while it was in flight, the epoch moved and this verdict is
+        // stale — a parallel subagent edit must not ride a review that never
+        // saw it.
+        if (gate.epoch !== reviewEpoch) {
+          gate.unresolved = [{
+            severity: 'major',
+            problem: 'the workspace changed while the review was running, so the pass does not cover that change',
+          }]
+        } else {
+          gate.dirtyCwds.delete(reviewedCwd)
+          gate.unresolved = undefined
+          gate.rounds = 0
+          gate.stalled = false
+          gate.findings = undefined
+        }
       } else {
         // Keep the gate shut: a fail only clears once a later review passes.
+        // This directory's dirty entry is cleared only when nothing else landed
+        // during the review; otherwise the in-flight edit is still unseen.
+        if (gate.epoch === reviewEpoch) gate.dirtyCwds.delete(reviewedCwd)
         gate.unresolved = blocking.length > 0 ? blocking : [{ severity: 'major', problem: 'agy reported a failure without naming a finding' }]
         gate.rounds += 1
         gate.findings = findings
-        gate.cleanFingerprint = undefined
       }
       return result
     }
+
     if (isMutating && result.isError === false) {
-      gate.dirty = true
-      gate.dirtyReason = FILE_MUTATING_TOOLS.has(execution.name) ? 'edit' : (gate.dirtyReason ?? 'shell')
-      gate.nudgedTurn = undefined
-      // Once new work happens after hitting the round cap, re-arm the gate.
+      // Compare only when both readings exist. An unavailable reading (not a
+      // git repository, git missing) is not evidence of a change, and treating
+      // it as one would demand a review of work that never happened.
+      if (isShell) {
+        const after = await repoFingerprint(reviewCwd, execution.signal)
+        // Unchanged repository: a read-only command. Recording it would force a
+        // review of a diff that does not exist, and would re-arm a stalled loop.
+        if (before !== undefined && after !== undefined && after === before) return result
+      }
+      markDirty(gate, reviewCwd, FILE_MUTATING_TOOLS.has(execution.name) ? 'edit' : 'shell')
+      // Once real work happens after hitting the round cap, re-arm the gate.
       if (gate.stalled) {
         gate.stalled = false
         gate.rounds = 0
@@ -724,26 +1003,9 @@ export function apply(ctx, config = {}) {
     ctx.effect(() => ctx.on('agent/turn-stopping', async ({ agent, turn }) => {
       if (agent.session.header.parentSession !== undefined && depthOf(agent) > 0) return
       const gate = gateOf(rootIdOf(agent))
-      if (!gate.dirty && gate.unresolved === undefined) return
+      if (gate.dirtyCwds.size === 0 && gate.unresolved === undefined) return
       if (gate.nudgedTurn === turn) return
       if (gate.stalled) return
-
-      // Read-only shell runs (`git status`, `npm test`) after a clean review
-      // must not force an unnecessary re-review if the repository is unchanged.
-      if (gate.dirty && gate.unresolved === undefined && gate.dirtyReason === 'shell' && gate.cleanFingerprint !== undefined && gate.lastCwd !== undefined) {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 2000)
-        try {
-          const current = await repoFingerprint(gate.lastCwd, controller.signal)
-          if (current !== undefined && current === gate.cleanFingerprint) {
-            gate.dirty = false
-            gate.dirtyReason = undefined
-            return
-          }
-        } finally {
-          clearTimeout(timer)
-        }
-      }
 
       const body = nudgeText(gate)
       if (body === undefined) return
@@ -763,8 +1025,12 @@ export function apply(ctx, config = {}) {
   /**
    * Collect what actually changed in the repository (working tree + any commits
    * created since the task's base HEAD + non-binary untracked files).
+   * @param cwd - repository root.
+   * @param exec - tool run context.
+   * @param baseHead - HEAD captured before the task's first mutation.
+   * @param budgetUnits - cap for the diff body, in `promptUnits`.
    */
-  async function collectDiff(cwd, exec, baseHead) {
+  async function collectDiff(cwd, exec, baseHead, budgetUnits = diffBudgetUnits) {
     const status = await runCommand(['git', 'status', '--porcelain', '-uall'], cwd, exec.signal)
     if (status.exitCode !== 0) return undefined
 
@@ -799,27 +1065,31 @@ export function apply(ctx, config = {}) {
     const { files, untracked } = parsePorcelainStatus(status.stdout)
     const body = diff.stdout
     if (body.trim().length === 0 && untracked.length === 0) {
-      return { empty: true, files, untracked, omittedUntracked: [], diff: '', stat: '', commits, baseLabel }
+      return { empty: true, files: [], untracked, omittedUntracked: [], skippedNoise: 0, diff: '', stat: '', commits, baseLabel }
     }
 
     let statText = ''
-    if (body.length > diffMaxChars) {
+    if (promptUnits(body) > budgetUnits) {
       const statRes = hasHead
         ? await runCommand(['git', '--no-pager', 'diff', '--stat', diffRef], cwd, exec.signal, 128 * 1024)
         : await runCommand(['git', '--no-pager', 'diff', '--stat'], cwd, exec.signal, 128 * 1024)
       if (statRes.exitCode === 0) statText = statRes.stdout.trim()
     }
 
-    const clipped = prioritizeAndClipDiff(body, diffMaxChars)
-    const remainingBudget = Math.max(0, diffMaxChars - clipped.diff.length)
+    const clipped = prioritizeAndClipDiff(body, budgetUnits)
+    const remainingBudget = Math.max(0, budgetUnits - promptUnits(clipped.diff))
     const untrackedResult = await collectUntrackedDiffs(cwd, untracked, remainingBudget)
     const combined = [clipped.diff.trimEnd(), untrackedResult.text.trimEnd()].filter(Boolean).join('\n\n')
 
     return {
       empty: false,
-      files,
-      untracked,
+      // The touched-file list is what agy reads first, so it must not advertise
+      // editor state either: a path listed here but absent from the diff reads
+      // as "changed and not shown", which is worse than not listing it.
+      files: files.filter(line => !isUntrackedNoise(porcelainPath(line))),
+      untracked: untracked.filter(path => !isUntrackedNoise(path)),
       omittedUntracked: untrackedResult.omitted,
+      skippedNoise: untrackedResult.skippedNoise,
       diff: combined,
       stat: statText,
       commits,
@@ -830,13 +1100,25 @@ export function apply(ctx, config = {}) {
   /** Effective default model & effort for a tier, factoring in task-level `agy_routes` overrides. */
   function resolveTierRoute(rootId, purpose) {
     const base = tiers[purpose] ?? tiers.consult
+    // The plugin page writes to the Host `agy-planner-config` row; a value set
+    // there outranks this row's static config but not a per-task `agy_routes`
+    // choice, because the latter is what the user picked for this task.
+    const hosted = ctx.get('agyModeDefaults')?.(purpose) ?? {}
+    // `present` means the configuration row is mounted and answered for this
+    // tier. A field it left empty is then an explicit "CLI default" choice, so
+    // this row's own default must not quietly step back in.
+    const answered = hosted.present === true
+    const tierBase = {
+      model: hosted.model ?? (answered ? undefined : base.model),
+      effort: hosted.effort ?? (answered ? undefined : base.effort),
+    }
     const override = rootId === undefined ? undefined : routes.get(rootId)
-    if (override === undefined) return base
+    if (override === undefined) return tierBase
     const specific = override[purpose]
     const fallback = purpose === 'review' ? override.plan : undefined
     return {
-      model: specific?.model ?? fallback?.model ?? override.default?.model ?? base.model,
-      effort: specific?.effort ?? fallback?.effort ?? override.default?.effort ?? base.effort,
+      model: specific?.model ?? fallback?.model ?? tierBase.model,
+      effort: specific?.effort ?? fallback?.effort ?? tierBase.effort,
     }
   }
 
@@ -852,16 +1134,22 @@ export function apply(ctx, config = {}) {
     if (args.effort !== undefined && !AGY_EFFORTS.includes(args.effort)) {
       throw new Error(`unknown reasoning effort ${JSON.stringify(args.effort)}; use one of ${AGY_EFFORTS.join(', ')}`)
     }
-    const cwd = resolveCwd(args, exec)
+    // Validate the directory only when the caller named one: the default is the
+    // session's own workspace, which the user already scoped. Checking it here
+    // rather than inside `resolveCwd` keeps that helper synchronous for the
+    // tools/execute middleware.
+    const cwd = args.cwd === undefined
+      ? resolveCwd(args, exec)
+      : await assertAllowedCwd(args.cwd, exec)
     const rootId = exec.agent === undefined ? undefined : rootIdOf(exec.agent)
     const tier = resolveTierRoute(rootId, purpose)
     // A model id that already carries the effort wins over the tier's effort.
     const { model, effort } = reconcileEffort(args.model ?? tier.model, args.effort ?? tier.effort)
 
-    // Guard argv against Windows 32k / Linux MAX_ARG_STRLEN limits.
-    const boundedPrompt = prompt.length > maxPromptChars
-      ? `${prompt.slice(0, maxPromptChars)}\n…[prompt truncated at ${maxPromptChars} chars to fit CLI argv limit]`
-      : prompt
+    // Guard argv against the platform's per-string limit, measured in bytes on
+    // POSIX rather than characters: a CJK prompt occupies three bytes per
+    // character, so a character count is not a limit at all.
+    const boundedPrompt = clipToUnits(prompt, promptLimit, `\n…[prompt truncated at ${promptLimit} units to fit the CLI argv limit]`)
 
     const executable = await ctx.subprocess.resolveExecutable(command, undefined, exec.signal)
 
@@ -1105,60 +1393,43 @@ export function apply(ctx, config = {}) {
     },
     timeoutMs: 60 * 60 * 1000,
     async execute(args, exec) {
-      const cwd = resolveCwd(args, exec)
+      // Validate a caller-named directory BEFORE collecting anything: the diff
+      // walk runs `git` there and reads untracked files, so refusing later (in
+      // `runAgy`) would already have touched a directory this session may not
+      // own.
+      // Canonical, because `baseHeads` is keyed by the same form the
+      // `tools/execute` middleware writes: a symlinked checkout (`/tmp` and
+      // `/private/tmp` on macOS) must not resolve to two different entries, or
+      // the task's starting commit would be invisible here.
+      const cwd = args.cwd === undefined
+        ? await canonicalCwd(resolveCwd(args, exec))
+        : await assertAllowedCwd(args.cwd, exec)
+      if (args.cwd !== undefined) args = { ...args, cwd }
       const rootId = exec.agent === undefined ? undefined : rootIdOf(exec.agent)
       const gate = rootId === undefined ? undefined : gateOf(rootId)
       const baseHead = rootId === undefined ? undefined : baseHeads.get(`${rootId}\0${cwd}`)
-
-      // A diff is ground truth; a description is not. Collect one unless the
-      // caller explicitly asks agy to explore the checkout instead.
-      const wanted = args.scope ?? 'diff'
-      const collected = wanted === 'diff' ? await collectDiff(cwd, exec, baseHead) : undefined
-      const scope = collected !== undefined && !collected.empty ? 'diff' : 'repo'
-
-      if (scope === 'repo' && args.work === undefined) {
-        throw new Error('No working-tree diff was found and no `work` description was given. Describe what changed, or set scope "repo" to let agy explore.')
-      }
 
       const focus = args.focus === undefined || args.focus.length === 0
         ? 'correctness, error handling, tests, and whether the work actually satisfies the requirement'
         : args.focus.join(', ')
 
-      const lines = [
-        'You are the quality gate for work another engineer just finished. Judge the code, not the description.',
-        '',
-      ]
-      if (scope === 'diff') {
-        lines.push(`This is the complete change under review (${collected.baseLabel}). Files touched:`)
-        lines.push(collected.files.map(file => `  ${file}`).join('\n') || '  (committed since task start)')
-        if (collected.commits) {
-          lines.push('', 'Commits created during this task:', collected.commits)
-        }
-        if (collected.stat) {
-          lines.push('', 'Diff stat:', collected.stat)
-        }
-        if (collected.omittedUntracked.length > 0) {
-          lines.push(`Untracked files omitted due to size/binary/budget (open if needed): ${collected.omittedUntracked.join(', ')}`)
-        }
-        lines.push('', '```diff', collected.diff.trim() || '(empty)', '```')
-      } else {
-        lines.push('No diff was available. Inspect the repository yourself; do not assume the description is accurate.')
-      }
-      if (args.work !== undefined) lines.push('', `What the author says they did: ${args.work}`)
-      if (args.requirements !== undefined) lines.push('', `Must satisfy: ${args.requirements}`)
-      if (args.evidence !== undefined) lines.push('', `How they verified it: ${args.evidence}`)
-
-      // Incremental review: re-litigating findings already reported wastes a
-      // full call. Ask about what remains instead.
-      if (gate?.findings !== undefined && gate.rounds > 0) {
-        lines.push(
-          '',
-          'A previous review already reported these. Check each against the code above and only repeat the ones that still stand:',
-          ...gate.findings.map(finding => `  - [${finding.severity}] ${finding.problem}${finding.file === undefined ? '' : ` (${finding.file})`}`),
-        )
-      }
-
-      lines.push(
+      // The tail carries the requirement, the evidence and the grading rules —
+      // the three things agy cannot infer from a diff. It is assembled before
+      // the diff so the budget can be taken from what is left, because the
+      // prompt is truncated at its END: a full-size diff used to silently drop
+      // the requirement and the pass/fail rubric instead of shrinking itself.
+      const tail = [
+        args.work === undefined ? undefined : `What the author says they did: ${args.work}`,
+        args.requirements === undefined ? undefined : `Must satisfy: ${args.requirements}`,
+        args.evidence === undefined ? undefined : `How they verified it: ${args.evidence}`,
+        // Incremental review: re-litigating findings already reported wastes a
+        // full call. Ask about what remains instead.
+        gate?.findings !== undefined && gate.rounds > 0
+          ? [
+            'A previous review already reported these. Check each against the code above and only repeat the ones that still stand:',
+            ...gate.findings.map(finding => `  - [${finding.severity}] ${finding.problem}${finding.file === undefined ? '' : ` (${finding.file})`}`),
+          ].join('\n')
+          : undefined,
         '',
         `Weigh hardest: ${focus}.`,
         '',
@@ -1167,7 +1438,81 @@ export function apply(ctx, config = {}) {
         'Judge the work against the requirement as stated, not against what you would have designed. A limitation the requirement never asked about is at most a minor note; never a blocker or major. When the requirement sets no contract for a case, say the case is uncovered rather than treating your assumed contract as broken.',
         'Blockers and major findings must be things that make the delivered work wrong, unsafe, or incomplete for what was asked.',
         'The verdict is "pass" when nothing at blocker or major severity remains; minor notes and nits may accompany a pass.',
-      )
+      ].filter(line => line !== undefined).join('\n')
+
+      const preamble = 'You are the quality gate for work another engineer just finished. Judge the code, not the description.'
+      // Everything that is not the diff. It is assembled first so the diff gets
+      // only what is left: the prompt is truncated at its end, and the tail is
+      // exactly the part agy cannot infer from the code.
+      const head = [
+        `This is the change under review (BASE_LABEL). Files touched:`,
+        'FILES',
+      ]
+      // One pass to learn how much room the non-diff sections will need, with a
+      // placeholder diff, so the real budget is measured rather than guessed.
+      const nonDiffProbe = [
+        preamble,
+        '',
+        ...head,
+        '', 'DIFF',
+        tail,
+      ].join('\n')
+      const nonDiffUnits = promptUnits(nonDiffProbe) - promptUnits('DIFF')
+      // `promptLimit` is the configured ceiling; the platform cap is the hard
+      // floor. Whichever is smaller is what the assembled prompt must fit.
+      const budgetCeiling = Math.min(promptLimit, PROMPT_LIMIT_BYTES)
+      const diffBudget = Math.max(1024, budgetCeiling - nonDiffUnits - 512)
+
+      // A diff is ground truth; a description is not. Collect one unless the
+      // caller explicitly asks agy to explore the checkout instead.
+      const wanted = args.scope ?? 'diff'
+      const collected = wanted === 'diff' ? await collectDiff(cwd, exec, baseHead, diffBudget) : undefined
+      const scope = collected !== undefined && !collected.empty ? 'diff' : 'repo'
+
+      if (scope === 'repo' && args.work === undefined) {
+        throw new Error('No working-tree diff was found and no `work` description was given. Describe what changed, or set scope "repo" to let agy explore.')
+      }
+
+      const lines = [preamble, '']
+      if (scope === 'diff') {
+        lines.push(`This is the change under review (${collected.baseLabel}). Files touched:`)
+        lines.push(collected.files.map(file => `  ${file}`).join('\n') || '  (committed since task start)')
+        if (collected.commits) {
+          // The commit list and the stat are not the change itself, so they are
+          // clipped rather than allowed to crowd out the diff.
+          lines.push('', 'Commits created during this task:', clipToUnits(collected.commits, 4_000, '…[more commits omitted]'))
+        }
+        if (collected.stat) {
+          lines.push('', 'Diff stat:', clipToUnits(collected.stat, 4_000, '…[stat truncated]'))
+        }
+        if (collected.omittedUntracked.length > 0) {
+          lines.push(`Untracked files omitted due to size/binary/budget (open if needed): ${clipToUnits(collected.omittedUntracked.join(', '), 2_000, '…')}`)
+        }
+        if (collected.skippedNoise > 0) {
+          lines.push(`Untracked editor/tool state skipped (${collected.skippedNoise} path(s)); it is not part of the change.`)
+        }
+      } else {
+        lines.push('No diff was available. Inspect the repository yourself; do not assume the description is accurate.')
+      }
+
+      // The assembled prompt must fit before the tail is appended, because
+      // `runAgy` can only clip from the end — and the end is the rubric.
+      const beforeDiff = `${lines.join('\n')}\n`
+      const closing = `\n${tail}`
+      const diffRoom = budgetCeiling - promptUnits(beforeDiff) - promptUnits(closing) - 32
+      if (scope === 'diff') {
+        if (diffRoom <= 128) {
+          // The requirement, the evidence and the rubric already fill the
+          // budget. Sending a stub diff beats sending a prompt whose tail
+          // `runAgy` would have to cut, and saying so is better than letting
+          // agy believe it saw the change.
+          lines.push('', '(The change was omitted: the prompt budget is exhausted by the requirement and evidence. Judge on those, and say so rather than assuming the diff is empty.)')
+        } else {
+          const body = collected.diff.trim() || '(empty)'
+          lines.push('', '```diff', clipToUnits(body, diffRoom, '\n…[diff clipped to fit the prompt budget]'), '```')
+        }
+      }
+      lines.push(tail)
 
       const result = await runAgy(args, exec, { purpose: 'review', schema: REVIEW_SCHEMA, prompt: lines.join('\n') })
       if (result.structured === undefined) {
@@ -1183,10 +1528,10 @@ export function apply(ctx, config = {}) {
       const round = gate === undefined ? 1 : gate.rounds + 1
       const review = { verdict, summary, findings }
 
-      if (gate !== undefined && verdict === 'pass') {
-        gate.cleanFingerprint = await repoFingerprint(cwd, exec.signal)
-        gate.lastCwd = cwd
-      }
+      // Gate state is settled by the `tools/execute` middleware, which also
+      // knows whether anything landed while this review was in flight.
+      // Clearing the dirty set here would be a decision taken from the review's
+      // own point of view, with no way to see a concurrent edit.
 
       return {
         verdict,

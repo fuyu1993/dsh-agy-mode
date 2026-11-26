@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Antigravity 规划模式",
-    "description": "新增一个继承标准模式的 Agent 模式：由 Antigravity CLI 负责规划、审核与质量把关，DSH 负责具体执行；开工前由你选择双方的模型、思考强度和子任务预算。模式名随界面语言在中文与英文之间切换。",
+    "description": "继承标准模式的 Agent 模式：Antigravity CLI 负责规划、审核与质量把关，DSH 负责具体执行；开工前由你选择双方的模型、思考强度和子任务预算。三档 agy 模型与思考强度可在插件页随时改，改完下一次调用即生效。模式名固定显示 Antigravity planner，不随界面语言变化。",
     "detail": "docs/DETAIL.md"
   }
 }

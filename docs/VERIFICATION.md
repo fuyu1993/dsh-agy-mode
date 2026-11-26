@@ -1,17 +1,29 @@
 # Verification
 
-What was actually run against the `agy` on this machine (`agy` 1.5.17,
+What was actually run against the `agy` on this machine (`agy` 1.5.18,
 `~/.local/antigravity/bin/agy`), and what remains unverified.
 
 ## Automated tests
 
 Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/fuyu/CodeProjects/dsh-agy-mode/test/index.test.js), which verifies:
 
-- Pure helpers: `reconcileEffort`, `resolveVerdict` (including empty `fail` locking the gate), `parsePorcelainStatus`, `prioritizeAndClipDiff` (source files prioritized ahead of lockfiles), `renderReview`, `authHint`, `transientHint`, `summarise`, and `boundedSet`.
+- Pure helpers: `reconcileEffort`, `resolveVerdict` (including empty `fail` locking the gate), `parsePorcelainStatus`, `prioritizeAndClipDiff` (source files prioritized ahead of lockfiles), `renderReview`, `authHint`, `transientHint`, `summarise`, `boundedSet`, `promptUnits`, `clipToUnits` (byte budget without splitting a character), and `isUntrackedNoise`.
 - Delegation guard across all budget branches and `agy_routes` inheritance across child sessions and tiers.
 - Review gate across root and subagent edits, empty-`fail` locking, `stalled` re-arming on new edits, and shell-only fingerprint verification against real temporary git repositories.
 - `collectDiff` inclusion of untracked text files, binary skipping, and `baseHead..HEAD` mid-task commit diffs.
 - `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
+
+22 tests in total as of 0.4.0.
+
+### 0.4.0
+
+- **Read-only shell no longer demands a review.** A task whose only shell call was `git status` closes with no steering; the same test then writes `app.js` through `bash` and gets steered, so the check distinguishes the two rather than skipping both. Measured against real temporary git repositories.
+- **A read-only shell does not re-arm a stalled loop.** After `maxReviewRounds` is hit, `git status` leaves `stalled` and `rounds` alone.
+- **A change during an in-flight review keeps the gate shut.** A subagent `write` lands while `agy_review` is running; the review returns `pass`, and the following close still steers with "changed while the review was running" instead of accepting the verdict.
+- **`cwd` containment.** An outside directory is refused with a message naming the workspace and the two config keys; the session's own directory, a configured `allowedRoots` entry, and `allowExternalCwd: true` each pass.
+- **Prompt budget.** With a CJK change of twice the prompt limit, the sent argv stays within `PROMPT_LIMIT_BYTES` and still carries `Must satisfy:`, `How they verified it:` and the pass/fail rubric — the tail that the old tail-truncation dropped first. The diff itself is clipped and says so.
+- **Editor state stays out.** `.idea/workspace.xml` appears neither in the diff, the touched-file list, nor the omitted list; the untracked source file next to it does, and the prompt reports only a count of skipped paths.
+- **Patch shape.** `cordis.patch.yml` parses with the loader's `js` tag: two insert rows (`agy-planner-config`, `preset-agy`), 24 child rows, `name` still a literal string, and 4 child `!!js` expressions preserved.
 
 ## Verified
 

@@ -81,33 +81,44 @@ git clone https://github.com/fuyu1993/dsh-agy-mode.git
 dsh plugin --profile <profile> add /绝对路径/dsh-agy-mode
 ```
 
-装好后重启一次 DSH，新建任务时在模式选择器里选 **Antigravity 规划模式**。
+装好后重启一次 DSH，新建任务时在模式选择器里选 **Antigravity planner**（这是固定英文名，不随界面语言变化）。
 
 ## 配置
 
-`cordis.patch.yml` 里 `agy-planner` 那一行：
+### 在插件页改模型与思考强度（推荐）
+
+**插件 → dsh-agy-mode** 页面顶部有一张「agy 模型与思考强度」卡片：规划、快问、审核三档各有一个模型输入框和强度下拉框。改完立即保存，**下一次 agy 调用就生效**，不用新建任务、不用重启。
+
+模型是输入框而非下拉，因为 `agy models` 是按账号和 CLI 版本返回的（本机 27 个，且会变）；卡片上有「列出本机可用模型」按钮，点一下就能看到当前可用的 id。
+
+页面写的是 `agy-planner-config` 这个 Host 行，它只存模型与强度，不注册任何工具，所以其它模式拿不到 agy 工具。
+
+### `cordis.patch.yml` 里的其它设置
+
+`agy-planner` 行（preset 内）：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `command` | `agy` | 可执行文件。裸名走 PATH，绝对路径会被校验。 |
 | `timeoutSeconds` | `900` | 单次咨询的 `--print-timeout`。0 表示不设限。 |
-| `planModel` / `planEffort` | `gemini-4-hydrogen` / `high` | 规划档：出方案时用。 |
-| `consultModel` / `consultEffort` | `gemini-3.8-flash` / `low` | 快问档：`mode: quick` 用。 |
-| `reviewModel` / `reviewEffort` | `gemini-4-hydrogen` / `high` | 审核档：`agy_review` 用。 |
 | `reuseConversations` | `true` | 同一任务内续接 agy 会话，不重复冷启动。 |
 | `maxConversationTurns` | `12` | 会话累积到这么多轮就换新的（太长反而更贵）。 |
 | `maxReviewRounds` | `3` | 连续审核失败几次后停下，不再自动重试。 |
-| `diffMaxChars` | `48000` | 送审 diff 的长度上限（Windows 下自动收紧以适配命令行长度限制）。 |
-| `maxPromptChars` | `96000`（Windows `26000`） | 单次通过 CLI 参数传递的提示词长度上限。 |
+| `diffMaxBytes` | `48000` | 送审 diff 的长度上限（旧名 `diffMaxChars` 仍可读）。 |
+| `maxPromptBytes` | Linux `120000` / macOS `500000` / Windows `26000` | 单次通过 CLI 参数传递的提示词上限，按平台计（旧名 `maxPromptChars` 仍可读）。 |
+| `allowExternalCwd` | `false` | 是否允许 `cwd` 指向会话工作区之外。 |
+| `allowedRoots` | `[]` | 额外允许 `cwd` 指向的目录。 |
 | `extraArgs` | `[]` | 额外透传给 `agy` 的命令行参数列表。 |
 | `retries` | `1` | 网关/限流这类瞬时失败的重试次数。 |
 | `requireReview` | `true` | 改成 `false` 关掉「改了东西就必须审核」的收尾拦截（`agy_review` 工具仍在）。 |
 
-`defaultModel` / `defaultEffort` 仍可设置，作为三档里没单独配的那档的兜底。
+`agy-planner-config` 行（Host 层）存 `planModel` / `planEffort` / `consultModel` / `consultEffort` / `reviewModel` / `reviewEffort`，也就是插件页编辑的那六个字段。优先级：单次调用参数 > 本任务 `agy_routes` > 插件页 > 内置默认。
+
+**`cwd` 校验**：agy 带 `--dangerously-skip-permissions` 只读运行，能读任何被指向的目录，而会话的沙箱策略不随之生效。所以 `cwd` 默认必须落在会话工作区内（`realpath` + `relative` 判定，兼容 `/tmp` → `/private/tmp` 软链与 Windows 盘符），越界会明确报错，要放行就配上面两项。
 
 **模型 id 自带强度**：agy 的模型名带后缀（`gemini-4-hydrogen-high`），此时再传 `--effort` 会被 agy 判为冲突并报错。插件会自动处理 —— 带后缀的 id 优先，不再额外传 effort；要让某一档真正换强度，就用不带后缀的 id（如 `gemini-4-hydrogen`）。
 
-三档只影响默认值，模式本身仍会在开工前问你。
+插件页与配置文件只影响默认值，模式本身仍会在开工前问你。
 
 ## 质量闸门怎么判定
 
@@ -162,6 +173,9 @@ agy 若没返回结构化结果，插件**报错而不是猜**：拿不到判定
 - 收尾拦截是「塞一条指令」而非硬失败：你明确说不要审核时，模型可以说明后结束。
 - 续接会话省的是冷启动的钱，但上下文会累积；到 `maxConversationTurns` 会自动换新会话。
 - 同一任务的 plan / quick / review 共用一个 agy 会话（同一个代码库，没必要分开重读）。换目录会自动新开。
+- 只读的 shell 命令（`git status`、`npm test`）不再被当成改动：插件在调用前后各算一次仓库指纹，变了才算脏。这也保证一条只读命令不会把已停下的审核循环重新启动。
+- 审核期间若有子任务改了文件，这次 `pass` **不算数**：闸门按 epoch 判定，会给出一条 major 并要求重审。
+- `.idea/`、`.vscode/`、`node_modules/`、`dist/` 这类编辑器与构建产物不进送审 diff（只报一个跳过数量），既省 token 也不会被误当成改动。
 - 网页渲染、浏览器操作这类 agy 自带工具对编程任务没用，但会在每次调用的固定开销里；目前没法裁剪。
 - 审核要花一次 agy 调用的时间与额度；大改动建议一次审完，不要一句一改一审核。
 - 子任务预算按任务记在内存里，**不落盘**：新任务会重新问，这是有意为之。
@@ -173,7 +187,7 @@ agy 若没返回结构化结果，插件**报错而不是猜**：拿不到判定
 
 见 [docs/VERIFICATION.md](docs/VERIFICATION.md)：记录了本机实测过什么、哪些还没验。
 
-简要：质量闸门用故意写错的代码测出 `fail` + blocker，用正确代码测出 `pass`；收尾拦截在「改过东西」时触发一次、同回合不重复、审核后不再触发、失败的工具调用不会误触发；中英模式名两种语言都正确解析；四个工具与子任务预算的四种判定路径全部通过。
+简要：质量闸门用故意写错的代码测出 `fail` + blocker，用正确代码测出 `pass`；收尾拦截在「改过东西」时触发一次、同回合不重复、审核后不再触发、失败的工具调用不会误触发；五个工具与子任务预算的四种判定路径全部通过。0.4.0 起 `npm test` 共 22 项，覆盖 shell 指纹、审核期间并发改动、`cwd` 白名单、超大中文 diff 的字节截断与编辑器目录过滤。
 
 ## 许可证
 

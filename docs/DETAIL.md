@@ -16,9 +16,12 @@ opinion of its work.
 | Model and effort chosen up front | no | yes, both sides |
 | Delegation budget | Host settings | per task, enforced |
 
-The mode declares the same 23 plugin rows as Standard and adds one row of its
-own, `agy-planner`, which registers all five tools inside the preset. Nothing is
-mounted at Host level, so no other mode gains them.
+The bundle inserts two rows. `preset-agy` declares the same 23 plugin rows as
+Standard and adds `agy-planner`, which registers all five tools inside the
+preset, so no other mode gains them. The second row, `agy-planner-config`, sits
+at Host level and holds only the model and effort choices, which is what lets
+the plugin page edit them: the settings service projects profile patch entries,
+and a preset's `plugins` list is not one.
 
 ## Mode name and language
 
@@ -165,6 +168,31 @@ See [VERIFICATION.md](VERIFICATION.md).
 
 ## Default route
 
-`gemini-4-hydrogen-high` at `high` effort, stored as `defaultModel` and
-`defaultEffort` on the `agy-planner` row. It applies only when a call omits the
-model or effort, and is offered as the recommendation during question 1.
+Three tiers, each with its own model and effort on the `agy-planner-config`
+row, so the plugin page can change them without a restart:
+
+| Tier | Used by | Default |
+|---|---|---|
+| `plan` | `agy_consult` (default mode) | `gemini-4-hydrogen` / `high` |
+| `consult` | `agy_consult` with `mode: quick` | `gemini-3.8-flash` / `low` |
+| `review` | `agy_review` | `gemini-4-hydrogen` / `high` |
+
+The fields are `volatile`, so a saved edit reaches the next call rather than the
+next session. Precedence, highest first: the call's own `model`/`effort`
+argument, the task's `agy_routes` choice, the plugin page, then built-in
+defaults. The recommendation offered during question 1 comes from the same
+place, so it follows whatever the page currently says.
+
+## Page-editable configuration
+
+`agy-planner-config` is a second mount of this package (`dsh-agy-mode/config`)
+whose `Config` is all hull and no machinery: it registers no tools and no hooks,
+only publishes a reader on the Host context that the preset-child row resolves
+with `ctx.get('agyModeDefaults')` on every call. The same package is mounted
+twice on purpose — one mount cannot both avoid leaking tools into other modes
+and be addressable by settings.
+
+Because a volatile field is a stable reference the Loader updates in place, the
+reader unwraps it at call time. Capturing the values in `apply` would freeze
+whatever was there at activation, which is exactly the value the page is meant
+to change.

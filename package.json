@@ -1,8 +1,8 @@
 {
   "name": "dsh-agy-mode",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "type": "module",
-  "description": "DSH agent mode where the local Antigravity CLI plans, reviews and signs off on quality while DSH executes. Three cost tiers, conversation reuse, diff-first review, enforced quality gate, and user-chosen models, effort and delegation budget.",
+  "description": "DSH agent mode where the local Antigravity CLI plans, reviews and signs off on quality while DSH executes. Three cost tiers, conversation reuse, diff-first review, an enforced quality gate, a delegation budget, and model/effort choices set on the plugin page.",
   "license": "MIT",
   "keywords": [
     "dsh",
@@ -26,7 +26,11 @@
   },
   "exports": {
     ".": "./index.js",
+    "./config": "./config.js",
+    "./config-model": "./config-model.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
+    "./locale/config/*.json": "./locale/config/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
@@ -34,15 +38,30 @@
     "README.md",
     "LICENSE",
     "index.js",
+    "config.js",
+    "config-model.js",
+    "client.js",
     "cordis.patch.yml",
     "locale/*.json",
+    "locale/config/*.json",
     "docs",
     "icon.svg",
     "package.json"
   ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
   }
 }

@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Antigravity planner mode",
-    "description": "An agent mode that inherits Standard: the Antigravity CLI plans, reviews and signs off on quality while DSH carries out the work. You choose both models, both reasoning efforts and the delegation budget before anything starts. The mode name follows the interface language.",
+    "description": "An agent mode that inherits Standard: the Antigravity CLI plans, reviews and signs off on quality while DSH carries out the work. You choose both models, both reasoning efforts and the delegation budget before anything starts. The three agy tiers are also editable on this plugin's page, and a change applies to the next agy call. The mode name is always Antigravity planner.",
     "detail": "docs/DETAIL.md"
   }
 }

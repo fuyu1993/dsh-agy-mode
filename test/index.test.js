@@ -7,11 +7,15 @@ import { join } from 'node:path'
 
 import {
   AGY_EFFORTS,
+  PROMPT_LIMIT_BYTES,
   apply,
   authHint,
   boundedSet,
+  clipToUnits,
+  isUntrackedNoise,
   parsePorcelainStatus,
   prioritizeAndClipDiff,
+  promptUnits,
   reconcileEffort,
   renderReview,
   resolveVerdict,
@@ -40,7 +44,7 @@ function makeAgent({ id = 'root-1', parentSession = undefined, depth = 0, cwd = 
   }
 }
 
-function makeMockCtx({ spawnHandler, liveAgents = [] } = {}) {
+function makeMockCtx({ spawnHandler, liveAgents = [], executors = {} } = {}) {
   const tools = new Map()
   const guards = []
   const listeners = new Map()
@@ -111,6 +115,10 @@ function makeMockCtx({ spawnHandler, liveAgents = [] } = {}) {
       if (denied !== undefined) return { isError: true, denied }
     }
     const executeChain = async () => {
+      // A tool with a real side effect runs it here, so middleware that samples
+      // the workspace before and after a call sees what a real call would do.
+      const sideEffect = executors[name]
+      if (sideEffect !== undefined) await sideEffect(args, agent)
       if (def === undefined) {
         return { isError: false, value: args?.mockResult ?? 'ok' }
       }
@@ -317,6 +325,17 @@ test('review gate: subagent edits mark root dirty, empty fail locks gate, and ed
         }),
         stderr: '',
       })),
+      // A shell call is only a candidate mutation; what it actually did decides.
+      // This executor mimics what `echo 3 > app.js` leaves behind.
+      executors: {
+        // The mock `edit` tool would otherwise change nothing, leaving no diff
+        // for the review to read. Write the file so the review has real input.
+        edit: () => writeFileSync(join(dir, 'app.js'), 'export const a = 2\n'),
+        bash: (args) => {
+          const match = /echo\s+(\S+)\s*>\s*app\.js/.exec(args?.command ?? '')
+          if (match !== null) writeFileSync(join(dir, 'app.js'), `export const a = ${match[1]}\n`)
+        },
+      },
     })
     sessions.set('root-1', root.agent.session)
     sessions.set('child-1', child.agent.session)
@@ -361,8 +380,7 @@ test('review gate: subagent edits mark root dirty, empty fail locks gate, and ed
     await stopTurn(root.agent, 7)
     assert.equal(root.steered.length, 4) // unchanged repo -> no spurious steer
 
-    // Real file change via bash IS detected by fingerprint check
-    writeFileSync(join(dir, 'app.js'), 'export const a = 3\n')
+    // Real file change via bash IS detected by the before/after fingerprint
     await callTool('bash', { command: 'echo 3 > app.js' }, root.agent)
     await stopTurn(root.agent, 8)
     assert.equal(root.steered.length, 5)
@@ -505,4 +523,415 @@ test('agy_models surfaces authHint on failure and returns defaults', async () =>
   assert.deepEqual(res.value.models, ['gemini-4-hydrogen', 'gemini-3.8-flash'])
   assert.deepEqual(res.value.efforts, AGY_EFFORTS)
   assert.match(res.value.defaults.plan, /gemini-4-hydrogen \/ high/)
+})
+
+// --- 0.4.0: shell fingerprinting, prompt budget, cwd containment, epochs ---
+
+test('clipToUnits measures bytes on POSIX and never splits a character', () => {
+  const cjk = '中'.repeat(50)
+  // 50 CJK chars = 150 UTF-8 bytes; a 90-unit budget keeps 30 of them.
+  const clipped = clipToUnits(cjk, 90, '…')
+  assert.ok(promptUnits(clipped) <= 90)
+  assert.ok(clipped.startsWith('中'))
+  for (const char of clipped.replace('…', '')) assert.equal(char, '中')
+
+  // ASCII shorter than the budget passes through untouched.
+  assert.equal(clipToUnits('short', 100, '…'), 'short')
+
+  // A budget of zero yields nothing rather than an empty-but-noted string.
+  assert.equal(clipToUnits('anything', 0, '…'), '')
+})
+
+test('prioritizeAndClipDiff budgets in bytes and still prefers source files', () => {
+  const lock = 'diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n' + '+x'.repeat(4000) + '\n'
+  const src = 'diff --git a/src/app.js b/src/app.js\n' + '+y'.repeat(2000) + '\n'
+  const clipped = prioritizeAndClipDiff(`${lock}${src}`, 5000)
+  assert.ok(promptUnits(clipped.diff) <= 5000)
+  assert.match(clipped.diff, /src\/app\.js/)
+})
+
+test('isUntrackedNoise separates editor state from deliverables', () => {
+  for (const path of ['.idea/vcs.xml', '.vscode/settings.json', '.openidea/.gitignore', 'node_modules/x/y.js', 'dist/bundle.js', '.DS_Store'])
+    assert.equal(isUntrackedNoise(path), true, path)
+  for (const path of ['src/app.js', 'docs/DETAIL.md', 'README.md', 'built-in/notes.md'])
+    assert.equal(isUntrackedNoise(path), false, path)
+})
+
+test('read-only shell does not mark a fresh task dirty, a mutating one does', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-shell-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'app.js'), 'export const a = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    const { ctx, sessions, callTool, stopTurn } = makeMockCtx({
+      spawnHandler: withRealGit(() => ({ exitCode: 0, stdout: '{}', stderr: '' })),
+      executors: {
+        bash: (args) => {
+          const match = /echo\s+(\S+)\s*>\s*app\.js/.exec(args?.command ?? '')
+          if (match !== null) writeFileSync(join(dir, 'app.js'), `export const a = ${match[1]}\n`)
+        },
+      },
+    })
+    sessions.set('root-1', root.agent.session)
+    apply(ctx, {})
+
+    // First close of a task that only ran a read-only command: no review asked
+    // for. This is the case that used to cost a full agy call for nothing.
+    await callTool('bash', { command: 'git status' }, root.agent)
+    await stopTurn(root.agent, 1)
+    assert.equal(root.steered.length, 0)
+
+    // A command that really writes the file does mark it dirty.
+    await callTool('bash', { command: 'echo 2 > app.js' }, root.agent)
+    await stopTurn(root.agent, 2)
+    assert.equal(root.steered.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a read-only shell does not reset a stalled review loop, real work does', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-stall-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'app.js'), 'export const a = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    const { ctx, sessions, callTool, stopTurn } = makeMockCtx({
+      spawnHandler: withRealGit(() => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          status: 'SUCCESS', conversation_id: 'c1', num_turns: 1, response: '',
+          structured_output: { verdict: 'fail', summary: 'bad', findings: [{ severity: 'blocker', problem: 'wrong' }] },
+        }),
+        stderr: '',
+      })),
+      executors: {
+        // The mock tools have no real effect; this one writes the file so the
+        // repository actually holds a change for the review to find.
+        edit: () => writeFileSync(join(dir, 'app.js'), 'export const a = 42\n'),
+        write: () => writeFileSync(join(dir, 'app.js'), 'export const a = 42\n'),
+        bash: (args) => {
+          const match = /echo\s+(\S+)\s*>\s*app\.js/.exec(args?.command ?? '')
+          if (match !== null) writeFileSync(join(dir, 'app.js'), `export const a = ${match[1]}\n`)
+        },
+      },
+    })
+    sessions.set('root-1', root.agent.session)
+    apply(ctx, { maxReviewRounds: 1 })
+
+    await callTool('edit', { path: 'app.js' }, root.agent)
+    await callTool('agy_review', {}, root.agent)
+    await stopTurn(root.agent, 1) // steers, then stalls
+    const afterStall = root.steered.length
+    assert.equal(afterStall, 1)
+
+    // A read-only command while stalled must not re-arm another round.
+    await callTool('bash', { command: 'git status' }, root.agent)
+    await stopTurn(root.agent, 2)
+    assert.equal(root.steered.length, afterStall)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a change during an in-flight review keeps the gate shut', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-epoch-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'app.js'), 'export const a = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    let onSpawn
+    const { ctx, sessions, callTool, stopTurn } = makeMockCtx({
+      spawnHandler: withRealGit(async () => {
+        // A parallel edit lands while agy is still reviewing. It goes through
+        // the write tool, which is the only thing that can move the gate's
+        // epoch — writing the file behind the tool's back would be a change no
+        // plugin could see, and so not the case under test.
+        if (onSpawn !== undefined) {
+          const callback = onSpawn
+          onSpawn = undefined
+          await callback()
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS', conversation_id: 'c1', num_turns: 1, response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }
+      }),
+      executors: {
+        write: () => writeFileSync(join(dir, 'app.js'), 'export const a = 7\n'),
+      },
+    })
+    sessions.set('root-1', root.agent.session)
+    apply(ctx, {})
+
+    await callTool('write', { path: 'app.js' }, root.agent)
+    const child = makeAgent({ id: 'child-1', parentSession: 'root-1', depth: 1, cwd: dir })
+    sessions.set('child-1', child.agent.session)
+    onSpawn = () => callTool('write', { path: 'app.js' }, child.agent)
+    const review = await callTool('agy_review', {}, root.agent)
+    assert.equal(review.value.verdict, 'pass')
+
+    // The verdict passed, but not for what is on disk now.
+    await stopTurn(root.agent, 1)
+    assert.equal(root.steered.length, 1)
+    assert.match(root.steered[0].content[0].text, /changed while the review was running/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('cwd outside the session workspace is refused unless configured', async () => {
+  const inside = mkdtempSync(join(tmpdir(), 'dsh-agy-cwd-in-'))
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-agy-cwd-out-'))
+  try {
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: inside })
+    const { ctx, callTool } = makeMockCtx()
+
+    // Default: contained to the session workspace.
+    apply(ctx, {})
+    await assert.rejects(
+      () => callTool('agy_consult', { prompt: 'hi', cwd: outside }, root.agent),
+      /outside the session workspace/,
+    )
+
+    // The session's own directory is allowed.
+    const ok = await callTool('agy_consult', { prompt: 'hi', cwd: inside }, root.agent)
+    assert.equal(typeof ok.value.text, 'string')
+
+    // A configured extra root is allowed.
+    const second = makeMockCtx()
+    apply(second.ctx, { allowedRoots: [outside] })
+    const allowed = await second.callTool('agy_consult', { prompt: 'hi', cwd: outside }, root.agent)
+    assert.equal(typeof allowed.value.text, 'string')
+
+    // The escape hatch works when the user asks for it.
+    const third = makeMockCtx()
+    apply(third.ctx, { allowExternalCwd: true })
+    const open = await third.callTool('agy_consult', { prompt: 'hi', cwd: outside }, root.agent)
+    assert.equal(typeof open.value.text, 'string')
+  } finally {
+    rmSync(inside, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('a review prompt keeps the rubric and requirement when the diff is huge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-budget-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'app.js'), 'export const a = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+    // A change larger than the whole prompt budget, in CJK: three bytes per
+    // character, so a character count would badly understate it.
+    const chars = Math.ceil((PROMPT_LIMIT_BYTES * 2) / 3)
+    writeFileSync(join(dir, 'app.js'), `export const a = '${'中'.repeat(chars)}'\n`)
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    let prompt
+    const { ctx, sessions, callTool } = makeMockCtx({
+      spawnHandler: withRealGit((opts) => {
+        prompt = opts.argv[opts.argv.indexOf('--print') + 1]
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS', conversation_id: 'c1', num_turns: 1, response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }
+      }),
+    })
+    sessions.set('root-1', root.agent.session)
+    apply(ctx, {})
+
+    await callTool('agy_review', {
+      requirements: 'The value must be the string "中" repeated.',
+      evidence: 'npm test passed',
+    }, root.agent)
+
+    // The point of the reordering: the tail survives even though the diff is
+    // clipped, and the argv stays under the platform limit.
+    assert.ok(promptUnits(prompt) <= PROMPT_LIMIT_BYTES, `prompt is ${promptUnits(prompt)} units`)
+    assert.match(prompt, /Must satisfy: The value must be the string/)
+    assert.match(prompt, /How they verified it: npm test passed/)
+    assert.match(prompt, /The verdict is "pass" when nothing at blocker or major severity remains/)
+    assert.match(prompt, /\[diff truncated|\[file diff truncated/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('editor state does not enter the review diff', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-noise-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'app.js'), 'export const a = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+    mkdirSync(join(dir, '.idea'), { recursive: true })
+    writeFileSync(join(dir, '.idea', 'workspace.xml'), '<project/>\n')
+    writeFileSync(join(dir, 'feature.js'), 'export const newFeature = true\n')
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    let prompt
+    const { ctx, sessions, callTool } = makeMockCtx({
+      spawnHandler: withRealGit((opts) => {
+        prompt = opts.argv[opts.argv.indexOf('--print') + 1]
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS', conversation_id: 'c1', num_turns: 1, response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }
+      }),
+    })
+    sessions.set('root-1', root.agent.session)
+    apply(ctx, {})
+
+    await callTool('agy_review', {}, root.agent)
+    assert.match(prompt, /feature\.js/)
+    assert.doesNotMatch(prompt, /workspace\.xml/)
+    assert.match(prompt, /editor\/tool state skipped/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// --- the configuration row's pure half ---
+
+test('readTier unwraps volatile references and drops empty choices', async () => {
+  const { readTier, createReader, TIERS } = await import('../config-model.js')
+
+  // A volatile field is a stable { get() } reference; the value must be read at
+  // call time, not captured, or a page edit never reaches agy.
+  let model = 'gemini-4-hydrogen'
+  let effort = 'high'
+  const live = {
+    planModel: { get: () => model },
+    planEffort: { get: () => effort },
+  }
+  assert.deepEqual(readTier(live, 'plan'), { model: 'gemini-4-hydrogen', effort: 'high' })
+
+  // The same object, after an in-place edit: the reader follows it.
+  model = 'gemini-4-carbon'
+  effort = 'xhigh'
+  assert.deepEqual(readTier(live, 'plan'), { model: 'gemini-4-carbon', effort: 'xhigh' })
+
+  // Empty means "CLI default" and must reach agy as no flag at all, not "".
+  assert.deepEqual(readTier({ planModel: { get: () => '' }, planEffort: { get: () => '' } }, 'plan'), {})
+  // An unknown effort is dropped rather than forwarded to --effort.
+  assert.deepEqual(readTier({ planEffort: { get: () => 'turbo' } }, 'plan'), {})
+  // A plain (non-volatile) value still works, for a row that is not volatile.
+  assert.deepEqual(readTier({ consultModel: 'gemini-3.8-flash' }, 'consult'), { model: 'gemini-3.8-flash' })
+
+  const reader = createReader(live)
+  assert.equal(typeof reader('plan'), 'object')
+  assert.deepEqual(reader('nonsense'), {})
+  assert.deepEqual(reader(undefined), {})
+  for (const tier of TIERS) assert.equal(typeof reader(tier), 'object')
+})
+
+test('parseModelCatalog reads ids from agy models output', async () => {
+  const { parseModelCatalog } = await import('../config-model.js')
+  const sample = 'gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-3.8-flash\tFlash\n\ngpt-oss-120b-medium\tOSS\n'
+  assert.deepEqual(parseModelCatalog(sample), ['gemini-4-hydrogen-high', 'gemini-3.8-flash', 'gpt-oss-120b-medium'])
+  // A signed-out CLI answers on stderr with an empty stdout: no ids, no throw.
+  assert.deepEqual(parseModelCatalog(''), [])
+  assert.deepEqual(parseModelCatalog(undefined), [])
+  // A display name is never mistaken for an id.
+  assert.deepEqual(parseModelCatalog('Gemini 4 Hydrogen (High)\n'), [])
+})
+
+test('a plugin-page choice reaches the agy argv for every tier', async () => {
+  const root = makeAgent({ id: 'root-1', depth: 0 })
+  const argvSeen = []
+  /** Reply shaped for whichever tool asked, so the review path also completes. */
+  const reply = (opts) => {
+    const wantsVerdict = opts.argv.includes('--json-schema')
+    return {
+      status: 'SUCCESS',
+      conversation_id: 'c1',
+      num_turns: 1,
+      response: 'ok',
+      ...wantsVerdict ? { structured_output: { verdict: 'pass', summary: 'ok', findings: [] } } : {},
+    }
+  }
+  const ctx = {
+    tools: { register: () => {}, guard: () => () => {} },
+    subprocess: {
+      async resolveExecutable(cmd) { return cmd },
+      spawn(opts) {
+        argvSeen.push(opts.argv)
+        return {
+          done: Promise.resolve({ exitCode: 0 }),
+          collected: {
+            stdout: { readFrom: () => ({ text: JSON.stringify(reply(opts)) }) },
+            stderr: { readFrom: () => ({ text: '' }) },
+          },
+        }
+      },
+    },
+    effect(fn) { return fn() },
+    on() { return () => {} },
+    get(service) {
+      if (service === 'workingDirectory') return { get: () => '/tmp' }
+      // The row is mounted and answers for every tier; `consult` is left empty
+      // on purpose, to prove an empty choice reaches agy as no flag at all.
+      if (service === 'agyModeDefaults') {
+        return (tier) => (tier === 'plan'
+          ? { present: true, model: 'page-model', effort: 'xhigh' }
+          : { present: true })
+      }
+      return undefined
+    },
+  }
+  apply(ctx, {})
+
+  const tools = new Map()
+  // Re-register over the no-op collector to reach the real definitions.
+  ctx.tools.register = def => tools.set(def.name, def)
+  apply(ctx, {})
+
+  await tools.get('agy_consult').execute({ prompt: 'plan please' }, { agent: root.agent, signal: new AbortController().signal })
+  const planArgv = argvSeen.at(-1)
+  assert.equal(planArgv[planArgv.indexOf('--model') + 1], 'page-model')
+  assert.equal(planArgv[planArgv.indexOf('--effort') + 1], 'xhigh')
+
+  // Consult tier: the page left it empty, so neither flag is passed. This is
+  // the case that used to fall back to `low` and defeat "CLI default".
+  await tools.get('agy_consult').execute({ prompt: 'quick question', mode: 'quick' }, { agent: root.agent, signal: new AbortController().signal })
+  const consultArgv = argvSeen.at(-1)
+  assert.equal(consultArgv.includes('--model'), false, 'consult must not send --model')
+  assert.equal(consultArgv.includes('--effort'), false, 'consult must not send --effort')
+
+  // Review tier, through the quality gate, with its own structured answer.
+  await tools.get('agy_review').execute({ work: 'changed things' }, { agent: root.agent, signal: new AbortController().signal })
+  const reviewArgv = argvSeen.at(-1)
+  assert.equal(reviewArgv.includes('--model'), false, 'review must not send --model')
 })

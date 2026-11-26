@@ -1,8 +1,28 @@
-# Antigravity planner mode: one preset declaration that restates Standard's
-# plugin inventory (an override replaces the complete `config`) and adds the
-# `agy` transport at the end. The transport is mounted inside the preset, never
-# at Host level, so no other mode gains these tools.
+# Antigravity planner mode.
+#
+# Two rows, and the split is deliberate:
+#
+#   agy-planner-config  Host level. Carries the model and effort choices as
+#                       volatile fields so this bundle's page in Plugins can
+#                       edit them live. Registers no tools, so it adds nothing
+#                       to any other mode.
+#   preset-agy          the agent mode itself: Standard's plugin inventory plus
+#                       the five `agy_*` tools, mounted inside the preset so no
+#                       other mode gains them.
+#
+# Only a profile patch entry is projected by the settings service, which is why
+# the configuration cannot simply live on the preset-child row: a preset's
+# `plugins` list is not an `include` entry.
 - insert:
+    - id: agy-planner-config
+      name: 'dsh-agy-mode/config'
+      config:
+        planModel: gemini-4-hydrogen
+        planEffort: high
+        consultModel: gemini-3.8-flash
+        consultEffort: low
+        reviewModel: gemini-4-hydrogen
+        reviewEffort: high
     - id: preset-agy
       name: '@deepseek-ai/dsh-agent-preset'
       config:
@@ -165,14 +185,9 @@
           - id: agy-planner
             name: 'dsh-agy-mode'
             config:
-              # Three cost tiers. An agy model id carries its own effort as a
-              # suffix, so a tier that must vary its effort uses an unsuffixed id.
-              planModel: gemini-4-hydrogen
-              planEffort: high
-              consultModel: gemini-3.8-flash
-              consultEffort: low
-              reviewModel: gemini-4-hydrogen
-              reviewEffort: high
+              # Model and effort live on the Host `agy-planner-config` row above,
+              # where the plugin page can edit them; this row only carries what
+              # is not user-facing. A value set here still wins as a fallback.
               reuseConversations: true
               maxConversationTurns: 12
               maxReviewRounds: 3
