@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Antigravity planner mode",
+    "description": "Adds an agent mode that inherits Standard: Antigravity CLI plans and reviews, DSH executes, and you choose both models, both reasoning efforts and the delegation budget before work starts.",
+    "detail": "docs/DETAIL.md"
+  }
+}

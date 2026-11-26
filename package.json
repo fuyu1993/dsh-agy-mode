@@ -1,0 +1,40 @@
+{
+  "name": "dsh-agy-mode",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DSH agent mode where the local Antigravity CLI plans and reviews while DSH executes, with user-chosen models, reasoning effort and delegation budget.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "agent-preset",
+    "antigravity",
+    "agy",
+    "gemini"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fuyu1993/dsh-agy-mode.git"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,161 @@
+# Antigravity planner mode: one preset declaration that restates Standard's
+# plugin inventory (an override replaces the complete `config`) and adds the
+# `agy` transport at the end. The transport is mounted inside the preset, never
+# at Host level, so no other mode gains these tools.
+- insert:
+    - id: preset-agy
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: agy
+        name: Antigravity planner
+        description: Antigravity CLI plans and reviews, DSH executes. You choose both routes and the delegation budget first.
+        # Beside the shipped presets: Standard is 1, PTC 2, Minimal 3, Creator 4.
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a coding agent powered by the {{model}} model, working in Antigravity planner mode.
+
+                Work is split in two. The local Antigravity CLI (`agy`) owns judgement — inspecting the repository, writing the implementation plan, deciding between approaches, and reviewing finished work. You own execution — every edit, command, test run, and commit is your work, done with your own tools. Do not plan by yourself and do not ask agy to change files; it runs read-only.
+
+                Before the first piece of real work in a session, once, ask the user four things with `ask_user_question` and wait for the answers:
+                1. the agy model and reasoning effort (`agy_models` lists the model ids; effort is one of low, medium, high, xhigh, max),
+                2. your own model and reasoning effort, telling them they can also switch it with the model control beside the composer,
+                3. whether subagents are allowed, how many may run at once, and how deep they may recurse,
+                4. anything the plan needs that you cannot discover yourself.
+
+                Then call `agy_delegation_budget` with their answer, so the limits you were given are enforced rather than remembered.
+
+                For every task: gather the facts you need by inspection, hand agy a self-contained brief through `agy_consult` (goal, relevant paths, constraints, success criteria), and make its plan the basis of your work. Where the plan is ambiguous, ask agy a follow-up rather than guessing. Implement it with your own tools, verify it the way the project expects, and before reporting completion send the diff and the verification result back to agy in review mode. Report agy's objections honestly, fix them or explain why not, and only then summarise for the user.
+
+                Keep the user in the loop at those seams: the initial choices, and any point where agy's review rejects your work in a way that changes the plan.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first with non-mutating reads and searches. In this mode the plan itself comes from `agy_consult`: give agy the facts you gathered, let it decide the approach, and turn its plan into yours. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer.
+
+                    Make the plan decision-complete: state the goal and success criteria, group changes by subsystem, name public API and data-flow changes, and cover edge cases, failure modes, tests and acceptance criteria. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response. If review rejects it, incorporate the feedback and present again.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-office
+            name: '@deepseek-ai/dsh-tool-office'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+          - id: agy-planner
+            name: 'dsh-agy-mode'
+            config:
+              # 本机 agy 的 settings.json 用的就是这个模型；模式仍会在开工前问用户。
+              defaultModel: gemini-4-hydrogen-high
+              defaultEffort: high
