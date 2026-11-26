@@ -5,7 +5,7 @@ What was actually run against the `agy` on this machine (`agy` 1.5.18,
 
 ## Automated tests
 
-Run `npm test` (or `node --test`) to execute [test/index.test.js](file:///Users/fuyu/CodeProjects/dsh-agy-mode/test/index.test.js), which verifies:
+Run `npm test` (or `node --test`) to execute `test/index.test.js`, which verifies:
 
 - Pure helpers: `reconcileEffort`, `resolveVerdict` (including empty `fail` locking the gate), `parsePorcelainStatus`, `prioritizeAndClipDiff` (source files prioritized ahead of lockfiles), `renderReview`, `authHint`, `transientHint`, `summarise`, `boundedSet`, `promptUnits`, `clipToUnits` (byte budget without splitting a character), and `isUntrackedNoise`.
 - Delegation guard across all budget branches and `agy_routes` inheritance across child sessions and tiers.

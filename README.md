@@ -73,13 +73,18 @@
 需要本机已装好并登录 `agy`（`agy --version` 有输出、`agy models` 能列模型）。
 
 ```bash
-# 从 GitHub 安装
+# 从 npm 安装（推荐：插件页会显示「版本」栏，可查看并升级到新版本）
+dsh plugin --profile <你的 profile> add dsh-agy-mode
+
+# 或从 GitHub 安装（版本栏不显示，升级需重装）
 dsh plugin --profile <你的 profile> add github:fuyu1993/dsh-agy-mode
 
 # 或克隆后本地安装
 git clone https://github.com/fuyu1993/dsh-agy-mode.git
 dsh plugin --profile <profile> add /绝对路径/dsh-agy-mode
 ```
+
+只有从 npm 安装的插件，插件详情页才会出现「版本」栏（可更新到哪个版本、还有几个新版本、逐版本升级）。从 GitHub 或本地路径安装的，Host 不认为它有可查询的版本序列，那一栏就不会渲染。
 
 装好后重启一次 DSH，新建任务时在模式选择器里选 **Antigravity planner**（这是固定英文名，不随界面语言变化）。
 
