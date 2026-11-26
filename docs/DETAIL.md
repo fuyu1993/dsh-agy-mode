@@ -1,57 +1,113 @@
 # Antigravity planner mode
 
-A DSH agent mode (preset) in which the **local Antigravity CLI (`agy`)** does the thinking — it inspects the repository, writes the plan, decides between approaches, and reviews the finished work — while **DSH does the work**: every edit, command, test run and commit.
-
-It is Standard mode plus three tools and a delegation guard, so it keeps Standard's shell, file, search, job, skill, plan, goal, compaction, subagent, workflow, web, office and plugin tools.
+An agent mode for DeepSeek Harness that inherits Standard mode and splits the
+work: the local Antigravity CLI (`agy`) owns judgement, DSH owns execution.
+Quality sign-off is agy's, enforced by the mode rather than left to DSH's own
+opinion of its work.
 
 ## What is different from Standard
 
-| Tool | Purpose |
-|---|---|
-| `agy_consult` | One read-only `agy` turn. `mode: plan` asks for an implementation plan, `mode: review` asks for a critique. Optional `model`, `effort` and `cwd`; returns agy's answer as text. |
-| `agy_models` | The model ids this `agy` accepts, plus the reasoning efforts `low` … `max`. |
-| `agy_delegation_budget` | Records the user's answer about delegated work: allowed or not, how many subagents may run at once, how many levels deep. |
+| | Standard | This mode |
+|---|---|---|
+| Technical judgement | DSH | `agy` |
+| Edits, commands, tests, commits | DSH | DSH |
+| Quality sign-off | DSH | `agy_review` structured verdict |
+| Closing a turn without review | allowed | steered back to review |
+| Model and effort chosen up front | no | yes, both sides |
+| Delegation budget | Host settings | per task, enforced |
 
-`agy` always runs in its own read-only plan mode with approvals skipped, so it can read the checkout but cannot change it. Files, edits and commands stay DSH's job.
+The mode declares the same 23 plugin rows as Standard and adds one row of its
+own, `agy-planner`, which registers all four tools inside the preset. Nothing is
+mounted at Host level, so no other mode gains them.
+
+## Mode name and language
+
+The preset's `name` and `description` are `!!js` expressions that read the
+interface language at load time and return the Chinese or English text:
+
+```yaml
+name: !!js "(() => { ... return lang.startsWith('en') ? \"Antigravity planner\" : \"Antigravity 规划模式\" })()"
+```
+
+Language resolution order:
+
+1. `DSH_AGY_MODE_LANG` (`en` → English, anything else → Chinese),
+2. `$DSH_HOME/locale.json` → `language`,
+3. `$DSH_HOME/desktop-locale.json` → `desktop` (this profile writes `zh`),
+4. fallback: Chinese.
+
+The expressions use only `process` globals, so they evaluate in the loader's
+empty scope and never depend on a service being available yet. `locale/zh.json`
+and `locale/en.json` carry the plugin-page title and description, which follow
+DSH's own locale mechanism.
 
 ## The start-of-task conversation
 
-Before the first real piece of work, the agent asks the user four things with `ask_user_question`:
+Before the first real work of a session, the mode asks four things with
+`ask_user_question`:
 
-1. the **agy** model and reasoning effort,
-2. **DSH's** own model and reasoning effort — the model control beside the composer also switches this at any time,
-3. whether subagents are allowed, how many at once, and how deep,
-4. whatever the plan needs that inspection cannot answer.
+1. the agy model and reasoning effort (`agy_models` supplies the ids),
+2. DSH's own model and reasoning effort,
+3. whether subagents are allowed, how many at once, how deep they may recurse,
+4. whatever the plan needs that DSH cannot discover itself.
 
-The answer to (3) is recorded with `agy_delegation_budget`. Until it is recorded, every `subagent`, `subagent_fork` and `workflow` call is refused, so the mode cannot quietly fan out work the user never approved. After it is recorded, each delegated call is checked against the live subagent count and the caller's depth before it starts.
+Question 3 is then recorded through `agy_delegation_budget`, which installs a
+guard on `subagent`, `subagent_fork` and `workflow`.
 
 ## Workflow
 
-1. Inspect the repository with DSH's read-only tools to gather facts.
-2. Send `agy_consult` a self-contained brief — goal, paths, constraints, success criteria — and take the returned plan as the basis.
-3. Implement with DSH's own tools, verifying the way the project expects.
-4. Before reporting completion, send the diff and verification result back through `agy_consult` in review mode; fix or explain each objection.
-5. Report the outcome, including anything agy raised that was not addressed.
+1. DSH inspects the repository to build a self-contained brief.
+2. `agy_consult` in plan mode returns the implementation plan. agy sees the
+   repository, never this conversation.
+3. DSH implements with its own tools and verifies the way the project expects.
+4. `agy_review` returns a structured verdict on the changes.
+5. Blockers and majors are fixed and re-reviewed; minors are reported.
 
-Plan mode (`/plan`) is unchanged in shape, but the plan itself comes from `agy_consult` until the user approves it.
+The mode enforces step 4: a turn that mutated the workspace cannot close until
+`agy_review` has run on those changes. The enforcement is a steering
+instruction, not a hard stop, so a user who declines the review can end the
+task by saying so.
+
+## The review contract
+
+`agy_review` sends a JSON Schema to agy's `--json-schema` flag and reads
+`structured_output` back:
+
+```json
+{
+  "verdict": "pass" | "fail",
+  "summary": "...",
+  "findings": [{ "severity": "blocker|major|minor|nit", "file": "...", "line": 1, "problem": "...", "fix": "..." }]
+}
+```
+
+The plugin, not the model, decides the gate: any blocker or major forces
+`fail`. A verdict of `pass` with only minor findings renders as
+`PASS with notes`. If agy returns no structured output, the tool throws rather
+than inventing a verdict.
+
+The prompt scopes agy to the requirement as stated, so a limitation the
+requirement never covered is a minor note rather than a blocker. Measured
+effect: the same piece of deliberately loose code went from `fail` (major) to
+`pass` (minor) after this constraint was added.
 
 ## Requirements and limits
 
-- `agy` must be on `PATH` and signed in once. A signed-out CLI is reported as such rather than as an empty answer.
-- One consultation is bounded by `timeoutSeconds` (default 900) and by a one-hour tool timeout.
-- `agy` does not see the conversation, so a vague prompt produces a vague plan. The preset instructs the agent to include the facts it gathered.
-- The delegation budget is held in memory per task and is not durable: a new task asks again, which is the intent.
-- The mode does not change the profile's permission policy; sandbox and approval settings still decide what DSH itself may do.
+- `agy` must be installed and signed in; a signed-out CLI reports only on
+  stderr and is translated into a sign-in hint.
+- `agy` always runs with `--mode plan`, so it cannot modify the repository even
+  with `--dangerously-skip-permissions` (verified empirically).
+- agy does not share the conversation; prompts must be self-contained.
+- Delegation budgets live in memory per task root and are not durable, so a
+  new task asks again. That is intentional.
+- Each consultation costs time and quota; review large changes in batches.
 
 ## Verification
 
-See [VERIFICATION.md](VERIFICATION.md) for what was checked on this machine and
-what remains unverified.
+See [VERIFICATION.md](VERIFICATION.md).
 
 ## Default route
 
-The bundle sets `defaultModel: gemini-4-hydrogen-high` and `defaultEffort: high`
-for `agy_consult`, matching the model this machine's `agy` is configured with.
-The mode still asks before work starts; the defaults only pre-fill the
-recommendation and cover a call that names no route. Change them in
-`cordis.patch.yml` under the `agy-planner` child row.
+`gemini-4-hydrogen-high` at `high` effort, stored as `defaultModel` and
+`defaultEffort` on the `agy-planner` row. It applies only when a call omits the
+model or effort, and is offered as the recommendation during question 1.

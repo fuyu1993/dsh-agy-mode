@@ -7,8 +7,10 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: agy
-        name: Antigravity planner
-        description: Antigravity CLI plans and reviews, DSH executes. You choose both routes and the delegation budget first.
+        # 模式名与描述跟随界面语言；判定集中在一处，改中文文案只改这一行。
+        # 界面为英文时显示英文名；DSH_AGY_MODE_LANG=en 可强制英文。
+        name: !!js "(() => (() => { const env = process.env.DSH_AGY_MODE_LANG; if (env) return env.toLowerCase().startsWith('en'); const fs = process.getBuiltinModule('node:fs'); const path = process.getBuiltinModule('node:path'); const home = process.env.DSH_HOME || path.join(process.getBuiltinModule('node:os').homedir(), '.dsh'); for (const name of ['locale.json', 'desktop-locale.json']) { try { const doc = JSON.parse(fs.readFileSync(path.join(home, name), 'utf8')); const tag = doc.language || doc.desktop || doc.preference; if (typeof tag === 'string' && tag.length) return tag.toLowerCase().startsWith('en') } catch {} } return false })() ? \"Antigravity planner\" : \"Antigravity 规划模式\")()"
+        description: !!js "(() => (() => { const env = process.env.DSH_AGY_MODE_LANG; if (env) return env.toLowerCase().startsWith('en'); const fs = process.getBuiltinModule('node:fs'); const path = process.getBuiltinModule('node:path'); const home = process.env.DSH_HOME || path.join(process.getBuiltinModule('node:os').homedir(), '.dsh'); for (const name of ['locale.json', 'desktop-locale.json']) { try { const doc = JSON.parse(fs.readFileSync(path.join(home, name), 'utf8')); const tag = doc.language || doc.desktop || doc.preference; if (typeof tag === 'string' && tag.length) return tag.toLowerCase().startsWith('en') } catch {} } return false })() ? \"Antigravity CLI plans, reviews and signs off on quality; DSH carries out the work. You choose both routes and the delegation budget before anything starts.\" : \"Antigravity CLI 负责规划、审核与质量把关，DSH 负责具体执行；开工前由你选择双方的模型、思考强度和子任务预算。\")()"
         # Beside the shipped presets: Standard is 1, PTC 2, Minimal 3, Creator 4.
         order: 5
         plugins:
@@ -18,7 +20,7 @@
               prefix: |-
                 You are a coding agent powered by the {{model}} model, working in Antigravity planner mode.
 
-                Work is split in two. The local Antigravity CLI (`agy`) owns judgement — inspecting the repository, writing the implementation plan, deciding between approaches, and reviewing finished work. You own execution — every edit, command, test run, and commit is your work, done with your own tools. Do not plan by yourself and do not ask agy to change files; it runs read-only.
+                Work is split in two. The local Antigravity CLI (`agy`) owns judgement — inspecting the repository, writing the implementation plan, deciding between approaches, and signing off on quality. You own execution — every edit, command, test run, and commit is your work, done with your own tools. Do not plan by yourself and do not ask agy to change files; it runs read-only.
 
                 Before the first piece of real work in a session, once, ask the user four things with `ask_user_question` and wait for the answers:
                 1. the agy model and reasoning effort (`agy_models` lists the model ids; effort is one of low, medium, high, xhigh, max),
@@ -28,7 +30,11 @@
 
                 Then call `agy_delegation_budget` with their answer, so the limits you were given are enforced rather than remembered.
 
-                For every task: gather the facts you need by inspection, hand agy a self-contained brief through `agy_consult` (goal, relevant paths, constraints, success criteria), and make its plan the basis of your work. Where the plan is ambiguous, ask agy a follow-up rather than guessing. Implement it with your own tools, verify it the way the project expects, and before reporting completion send the diff and the verification result back to agy in review mode. Report agy's objections honestly, fix them or explain why not, and only then summarise for the user.
+                For every task: gather the facts you need by inspection, hand agy a self-contained brief through `agy_consult` (goal, relevant paths, constraints, success criteria), and make its plan the basis of your work. Where the plan is ambiguous, ask agy a follow-up rather than guessing. Implement it with your own tools and verify it the way the project expects.
+
+                Quality is agy's call, not yours. Before you report completion, call `agy_review` with what you changed, what it had to satisfy, and how you verified it. Treat a blocker or major finding as unfinished work: fix it and review again. A minor finding or nit you may leave, but say so and why. Never report a task as done with an unaddressed blocker, and never claim a check passed that you did not run. If the review fails twice on the same point, stop and tell the user what agy objects to instead of looping.
+
+                The mode also enforces this: a turn that changed something will not close until `agy_review` has run on those changes, so a review you skip comes back as a steering instruction.
 
                 Keep the user in the loop at those seams: the initial choices, and any point where agy's review rejects your work in a way that changes the plan.
           - id: agent-instructions

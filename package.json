@@ -1,8 +1,8 @@
 {
   "name": "dsh-agy-mode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "DSH agent mode where the local Antigravity CLI plans and reviews while DSH executes, with user-chosen models, reasoning effort and delegation budget.",
+  "description": "DSH agent mode where the local Antigravity CLI plans, reviews and signs off on quality while DSH executes, with user-chosen models, reasoning effort and delegation budget. Mode name switches between Chinese and English.",
   "license": "MIT",
   "keywords": [
     "dsh",
@@ -11,7 +11,10 @@
     "agent-preset",
     "antigravity",
     "agy",
-    "gemini"
+    "gemini",
+    "quality-gate",
+    "review",
+    "i18n"
   ],
   "repository": {
     "type": "git",

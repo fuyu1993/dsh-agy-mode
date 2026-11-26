@@ -1,47 +1,91 @@
 # Verification
 
-Checked against this machine's installation on 2026-11-26 (dsh 0.2.2-rc.5 via
-Desktop, profile `desktop`, `agy` 1.5.17).
+What was actually run against the `agy` on this machine (`agy` 1.5.17,
+`~/.local/antigravity/bin/agy`), and what remains unverified.
 
-## What was run
+## Verified
 
-| Check | Result |
-|---|---|
-| Bundle installs into the profile (`plugin_manager` `install_bundle`) | `application: applied`; package linked at `~/.dsh/profiles/desktop/node_modules/dsh-agy-mode` |
-| `preset-agy` row is active | `list_plugins` at `offset: 200` shows `include:preset-agy`, `fiberPhase: active` |
-| Declaration reaches the Loader with a schema | `Config.listConfigs` lists `include:preset-agy` with `status: schema` |
-| Whole profile still composes with the new rows | A copy of the profile dumped with `dsh --profile <copy> --dump-config` contains the `dsh-agy-mode` section, `preset-agy`, and the `agy-planner` child at the end of the preset's plugin list |
-| Patch structure | 1 inserted row, preset `agy`, order 5, 24 child rows, no duplicate child ids |
-| Every child package resolves from the installation | 28 package names checked with `require.resolve`; all resolve |
-| Every child `config` key exists in the installed package | checked for plan-mode, skill-filesystem, tool-fs, tool-pruner, tool-todo, tool-web, subagent, workflow-ptc, agent-instructions, tool-fs-search |
-| Plugin module syntax | `node --check index.js` clean |
-| Plugin behaviour against the real CLI | see below |
+### Composition
 
-## Plugin behaviour (stub Host services, real `agy`)
+- `dsh --profile <copy of desktop> --dump-config` composes `preset-agy` with 24
+  child rows: the 23 Standard rows plus `agy-planner`.
+- The mode name resolves both ways with the loader's own evaluation
+  (`with (ctx) eval(expr)` against an empty scope): `Antigravity 规划模式` in
+  Chinese, `Antigravity planner` in English. `DSH_AGY_MODE_LANG=en` overrides,
+  and a missing locale file falls back to Chinese.
+- The bundle parses as YAML with the loader's `!!js` tag, and the profile's own
+  patch still parses.
 
-- `agy_models` returned 27 model ids and the five efforts.
-- `agy_consult` with `model: gemini-3.8-flash-low`, `effort: low` returned the
-  expected one-line answer, reporting back the model and effort it used.
-- The delegation guard refused `subagent` before any budget was recorded,
-  allowed it under `{ allow: true, maxChildren: 2, maxDepth: 1 }`, refused a
-  child at depth 1, and refused everything after `allow: false`.
-- Unrelated tools were never blocked by the guard.
+### Tools
+
+- `agy_models` returns 27 model ids and the five effort levels.
+- `agy_consult` returns the CLI's answer and echoes the model and effort used;
+  the configured default route (`gemini-4-hydrogen-high` / `high`) works when
+  the call omits both.
+- `agy_delegation_budget` records a budget and the guard then behaves on all
+  four paths: no budget → denied, allowed → passed, depth 1 with `maxDepth` 1 →
+  denied, `allow: false` → denied.
+- `agy_review` returns structured output driven by agy's `--json-schema`.
+
+### The quality gate
+
+Measured with a deliberately wrong implementation
+(`total = (a, b) => a - b`, requirement "total must be the sum of a and b"):
+
+- verdict `fail`, 2 findings, severities `blocker` and `major`, with
+  `app.js:1` and a concrete fix. The blocking finding was not generic: agy
+  named the wrong operator.
+
+Measured with the corrected implementation (`a + b`) plus its verification
+output:
+
+- verdict `pass` with minor notes only (no test suite; the requirement says
+  nothing about non-number inputs).
+- Before the prompt was scoped to the stated requirement, the same code was a
+  `fail` with a major finding about string concatenation. The scoping changed
+  the outcome, which is why it is in the prompt.
+
+A `fail` carrying nothing above minor severity now renders as
+`PASS with notes`, and the gate keys on severity rather than on the model's
+verdict string alone.
+
+### The closing-turn enforcement
+
+- A clean session closes with no steering.
+- After a successful mutating call, the close is steered exactly once, and the
+  injected instruction names `agy_review`.
+- Closing the same turn twice does not steer twice.
+- After a successful `agy_review`, the session closes without steering.
+- A **failed** mutating call does not mark the session dirty, so an error does
+  not demand a review.
+
+### CLI behaviour relied on
+
+- `agy` in `--mode plan` cannot create files even with
+  `--dangerously-skip-permissions`: a run that wrote files outside plan mode
+  wrote none inside it.
+- A signed-out CLI prints `not logged into Antigravity` on stderr, which the
+  plugin maps to a sign-in hint instead of returning the empty answer the CLI
+  produces.
+- `--json-schema` yields `structured_output` alongside `response`.
 
 ## Not verified
 
-- The rendered mode name, description and icon in the Web UI's mode picker:
-  they need a page reload after the Host picked up the bundle, and the picker
-  was not driven in a browser here.
-- A live conversation running the whole loop (ask → plan with agy → implement →
-  review with agy): that needs a new session created with this mode selected.
-- `agy` was signed in on this machine. A signed-out CLI is reported as advice
-  rather than an empty answer, but that path was not exercised end to end.
+- The rendered mode picker: the name, description and icon as drawn in the Web
+  and desktop UI. The declaration and its language resolution are verified; the
+  pixels are not.
+- A complete real conversation: user answers → `agy_consult` plan → DSH
+  implements → `agy_review` → fix → report, driven by a live model rather than
+  a test harness.
+- The review gate under a Host where `agents.list()` is unavailable: the
+  descendant count then reports 0, so `maxChildren` cannot be exceeded by that
+  path. The depth limit and the `allow` flag still apply.
+- Behaviour against `agy` versions other than 1.5.17.
 
 ## After publishing
 
-The published package is named `dsh-agy-mode` (it was `@local/dsh-agy-mode`
-while it only lived in this profile), so the composable row now reads
-`name: dsh-agy-mode`. The plugin code is unchanged; the stub-host harness was
-re-run after the rename and behaves identically. Re-installing this profile's
-entry from the repository is required for the local link to carry the new
-name.
+The package was renamed from `@local/dsh-agy-mode` to `dsh-agy-mode` before the
+first push, so the install line in the README (`github:fuyu1993/dsh-agy-mode`)
+matches the row name the plugin manager creates. A second commit added
+`./package.json` to `exports`, because tooling that reads the manifest by
+subpath otherwise fails with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
