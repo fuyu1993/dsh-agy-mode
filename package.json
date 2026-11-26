@@ -32,7 +32,6 @@
     "./config-runtime": "./config-runtime.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./locale/config/*.json": "./locale/config/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
@@ -46,7 +45,6 @@
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "locale/config/*.json",
     "docs",
     "icon.svg",
     "package.json"

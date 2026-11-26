@@ -25,7 +25,7 @@
  * The one DSH package this bundle touches is `@deepseek-ai/schemastery`, and
  * only from `config.js` (the Host-level settings row), never from here.
  *
- * @module dsh-agy-mode
+ * @module dsh-agy-mode/planner
  */
 
 import { homedir, tmpdir } from 'node:os'

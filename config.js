@@ -22,7 +22,7 @@
  * that connects them. The split is not cosmetic: a row whose mount code cannot
  * be reached by `npm test` is a row that ships bugs.
  *
- * @module dsh-agy-mode/config
+ * @module dsh-agy-mode
  */
 
 import z from '@deepseek-ai/schemastery'
