@@ -14,7 +14,7 @@ Run `npm test` (or `node --test`) to execute `test/index.test.js`, which verifie
 - `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
 - A read-only shell call during an in-flight review leaving the pass valid.
 
-29 tests in total as of 0.4.5.
+30 tests in total as of 0.4.6.
 
 ### 0.4.5
 
@@ -33,11 +33,20 @@ Two defects found by an audit, both reachable in ordinary use.
   through to `markDirty`, which bumps the epoch — so a `git status` arriving
   while `agy_review` was in flight made its verdict look stale and the task was
   steered back to re-review approved work. It also paid three git invocations
-  plus up to 200 `stat`s for an answer it threw away. Both are fixed by only
-  judging a call whose effect was actually sampled.
+  plus up to 200 `stat`s for an answer it threw away.
+  The first attempt at this fixed the symptom and broke the invariant: skipping
+  `markDirty` for every shell call on a dirty directory also skipped a mutating
+  `bash` that landed mid-review, so its edit was credited to a pass that never
+  saw it. The gate now carries an in-flight review counter (`gate.reviews`), and
+  a shell call is fingerprinted whenever the task is clean *or* a review is
+  running; only an unchanged fingerprint short-circuits. No dirtiness shortcut
+  remains.
 
-Both are covered by a test that fails when the fix is reverted to the 0.4.4
-behaviour (verified by reverting each in turn: `not ok 28` and `not ok 29`).
+Three tests guard this, and each was confirmed red against the behaviour it is
+meant to reject rather than merely green against the new code:
+`not ok 28` when the symlink guards are removed, `not ok 29` when a shell call on
+a dirty task is not fingerprinted (the 0.4.4 behaviour), and `not ok 30` when a
+dirty directory short-circuits `markDirty` (the rejected first attempt).
 
 ### 0.4.1
 

@@ -14,6 +14,7 @@
 # 用法 / Usage:
 #   scripts/release.sh --notes FILE    # 用指定文件作为 Release 正文（必填）
 #   scripts/release.sh --notes FILE --title TEXT   # 指定 Release 标题
+#   scripts/release.sh --notes FILE --otp 123456   # 2FA 账号发布 npm 用
 #   scripts/release.sh --notes FILE --dry-run      # 只检查，不发布
 #
 # 标题缺省为 tag 名；建议用双语形式，与 CONTRIBUTING.md 的约定一致。
@@ -31,6 +32,7 @@ REGISTRY='https://registry.npmjs.org/'
 DRY_RUN=0
 NOTES=''
 TITLE=''
+OTP=''
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,6 +43,9 @@ while [ $# -gt 0 ]; do
     --title)
       [ $# -ge 2 ] || { echo 'release: --title needs text' >&2; exit 2; }
       TITLE="$2"; shift 2 ;;
+    --otp)
+      [ $# -ge 2 ] || { echo 'release: --otp needs a code' >&2; exit 2; }
+      OTP="$2"; shift 2 ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "release: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -143,7 +148,16 @@ gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES" --verify-tag
 
 # 显式指定 registry：本机 ~/.npmrc 默认指向镜像，认证只对 npmjs 有效。
 step "publish to $REGISTRY"
-npm publish --access public --registry "$REGISTRY"
+# 2FA 账号需要一次性验证码；没有它 npm 会在推完 main、tag 与 Release 之后才报
+# EOTP，留下脚本本想避免的半发布状态。
+# A 2FA account needs a one-time password; without it npm fails with EOTP only
+# after main, the tag and the Release are already out — the half-published state
+# this script exists to prevent.
+if [ -n "$OTP" ]; then
+  npm publish --access public --registry "$REGISTRY" --otp "$OTP"
+else
+  npm publish --access public --registry "$REGISTRY"
+fi
 
 # --- 5. 一致性校验 / verify -------------------------------------------------
 

@@ -623,6 +623,10 @@ export function apply(ctx, config = {}) {
         nudgedTurn: undefined,
         stalled: false,
         findings: undefined,
+        // Reviews currently in flight for this root. A shell call arriving
+        // during one must be judged by its effect even on an already-dirty
+        // directory: otherwise its edit is silently credited to that review.
+        reviews: 0,
       }
       boundedSet(gates, rootId, gate)
     }
@@ -936,12 +940,30 @@ export function apply(ctx, config = {}) {
     // review cannot have judged.
     const reviewEpoch = execution.name === 'agy_review' && rootId !== undefined ? gateOf(rootId).epoch : undefined
     const reviewCwd = callCwd
+    // Sample the repository before a shell call when the answer can matter: on a
+    // clean task (to learn whether this call is what dirtied it) and during an
+    // in-flight review (where a read-only command must not appear to change
+    // anything, and a mutating one must not be credited to that review).
+    const entryGate = rootId === undefined ? undefined : gateOf(rootId)
+    const reviewing = entryGate !== undefined && entryGate.reviews > 0
+    const alreadyDirty = entryGate !== undefined && entryGate.dirtyCwds.has(reviewCwd)
     let before
-    if (isShell && agent !== undefined && rootId !== undefined && !gateOf(rootId).dirtyCwds.has(reviewCwd)) {
+    if (isShell && agent !== undefined && rootId !== undefined && (!alreadyDirty || reviewing)) {
       before = await repoFingerprint(reviewCwd, execution.signal)
     }
 
-    const result = await next()
+    // Count this review as in flight for the whole of its own execution, so
+    // concurrent shell calls are measured rather than assumed.
+    if (entryGate !== undefined && execution.name === 'agy_review') entryGate.reviews += 1
+
+    let result
+    try {
+      result = await next()
+    } finally {
+      // Always release, including on a thrown or rejected review: a leak here
+      // would keep sampling fingerprints for the rest of the task.
+      if (entryGate !== undefined && execution.name === 'agy_review') entryGate.reviews = Math.max(0, entryGate.reviews - 1)
+    }
     if (agent === undefined || rootId === undefined) return result
     const gate = gateOf(rootId)
 
@@ -996,12 +1018,10 @@ export function apply(ctx, config = {}) {
         if (before !== undefined) {
           const after = await repoFingerprint(reviewCwd, execution.signal)
           // Unchanged repository: a read-only command. Recording it would force
-          // a review of a diff that does not exist, and would re-arm a stalled loop.
+          // a review of a diff that does not exist, would re-arm a stalled loop,
+          // and — when a review is in flight — would bump the epoch and make a
+          // legitimate pass look stale.
           if (after !== undefined && after === before) return result
-        } else if (gate.dirtyCwds.has(reviewCwd)) {
-          // The directory is already dirty, so this call cannot make the gate
-          // stricter than it is. Recording it would only move the epoch.
-          return result
         }
       }
       markDirty(gate, reviewCwd, FILE_MUTATING_TOOLS.has(execution.name) ? 'edit' : 'shell')

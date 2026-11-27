@@ -1113,6 +1113,9 @@ test('collectDiff skips an untracked symlink instead of quoting its target', asy
     const secret = join(outside, 'credentials')
     writeFileSync(secret, 'AWS_SECRET_ACCESS_KEY=should-never-be-quoted\n')
     symlinkSync(secret, join(dir, 'leak'))
+    // An ordinary untracked file beside the link: without it, a guard that
+    // wrongly omitted every file would still pass this test.
+    writeFileSync(join(dir, 'ordinary.js'), 'export const ordinary = 7\n')
 
     let lastPrompt = ''
     const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
@@ -1141,6 +1144,8 @@ test('collectDiff skips an untracked symlink instead of quoting its target', asy
     // The secret must not appear, and the skip must be visible rather than silent.
     assert.doesNotMatch(lastPrompt, /AWS_SECRET_ACCESS_KEY/)
     assert.match(lastPrompt, /leak \(symlink\)/)
+    // The neighbours must survive: the guard skips links, not untracked files.
+    assert.match(lastPrompt, /export const ordinary = 7/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
     rmSync(outside, { recursive: true, force: true })
@@ -1208,6 +1213,67 @@ test('a read-only shell call during a review does not invalidate the pass', asyn
     // The pass must stand: closing the turn must not steer the agent back.
     await stopTurn(root.agent, 1)
     assert.deepEqual(root.steered, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a shell edit during an in-flight review still keeps the gate shut', async () => {
+  // The mirror of the previous test, and the reason a dirtiness short-circuit is
+  // wrong: on an already-dirty task, skipping the fingerprint for every shell
+  // call means a mutating `bash` landing mid-review is never recorded. The pass
+  // is then accepted, dirtyCwds is cleared, and the edit goes unreviewed.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-shellrev-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'base.js'), 'export const base = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    let releaseReview
+    const reviewGate = new Promise(resolve => { releaseReview = resolve })
+    let reviewStarted
+    const reviewStart = new Promise(resolve => { reviewStarted = resolve })
+
+    const { ctx, callTool, stopTurn } = makeMockCtx({
+      // This bash call really rewrites a file, like `sed -i` or a code generator.
+      executors: {
+        bash: async () => { writeFileSync(join(dir, 'base.js'), 'export const base = 3\n') },
+      },
+      spawnHandler: withRealGit((opts) => {
+        if (!opts.argv.includes('--json-schema')) return { exitCode: 0, stdout: 'ok', stderr: '' }
+        reviewStarted()
+        return reviewGate.then(() => ({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS',
+            conversation_id: 'conv-s',
+            num_turns: 1,
+            response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }))
+      }),
+    })
+    apply(ctx)
+
+    // Dirty the task first, so the gate is in exactly the state that mattered.
+    await callTool('edit', { path: 'base.js' }, root.agent)
+    writeFileSync(join(dir, 'base.js'), 'export const base = 2\n')
+
+    const reviewPromise = callTool('agy_review', {}, root.agent)
+    await reviewStart
+    await callTool('bash', { command: 'sh -c "rewrite base.js"' }, root.agent)
+    releaseReview()
+    await reviewPromise
+
+    // The pass cannot cover an edit it never saw, so the turn must be steered.
+    await stopTurn(root.agent, 1)
+    assert.notDeepEqual(root.steered, [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
