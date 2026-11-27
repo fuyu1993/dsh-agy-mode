@@ -63,6 +63,25 @@ TAG="v$VERSION"
 
 step "version $VERSION (tag $TAG)"
 
+# tag 名必须与将要被标记的那个提交里的版本一致。
+#
+# 手工发布时最易犯的错：改了代码、忘了提 package.json 的版本，就直接
+# `git tag -a vX.Y.Z`。tag 于是指向一个仍声明旧版本的提交，别人 checkout 该 tag
+# 得到的 package.json 与版本号不符——我在 0.4.7 与 0.4.8 上各犯过一次。脚本本来
+# 就从 package.json 推导 tag，所以这里额外确认「当前 HEAD」与「即将打 tag 的提交」
+# 是同一棵树，并且其中声明的版本正是要发布的版本。
+#
+# The tag name must agree with the version declared by the very commit it will
+# point at. The easy human mistake is to change code, forget to bump
+# `package.json`, and run `git tag -a vX.Y.Z` anyway: the tag then names a commit
+# whose manifest still declares the previous version, so a checkout of that tag
+# disagrees with its own name. Both 0.4.7 and 0.4.8 were tagged that way once.
+# The script derives the tag from `package.json`, so what this adds is the check
+# that the commit about to be tagged is HEAD and declares the released version.
+HEAD_VERSION=$(git show 'HEAD:package.json' 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version))}catch{process.stdout.write("")}})')
+[ "$HEAD_VERSION" = "$VERSION" ] \
+  || fail "the version in HEAD's package.json ($HEAD_VERSION) does not match $VERSION; commit the bump before tagging"
+
 # --- 前置检查 / preconditions -----------------------------------------------
 
 # 版本未被占用：已发布的版本不可覆盖，早失败好过推送后才发现。
@@ -175,8 +194,17 @@ gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES" --verify-tag
 # --- 5. 一致性校验 / verify -------------------------------------------------
 
 step 'verify'
-REMOTE_HEAD=$(git rev-parse 'origin/main' 2>/dev/null || true)
 TAG_HEAD=$(git rev-parse "$TAG^{commit}")
+
+# 打出来的 tag 必须指向一个声明该版本的提交。这是上一步的复核：推送之后再查一次，
+# 因为中途可能有别的提交混进来。
+# The tag must point at a commit that declares the version. This re-checks after
+# the pushes, since something could have landed in between.
+TAGGED_VERSION=$(git show "$TAG_HEAD:package.json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version))}catch{process.stdout.write("")}})')
+[ "$TAGGED_VERSION" = "$VERSION" ] \
+  || fail "tag $TAG points at a commit whose package.json declares $TAGGED_VERSION, not $VERSION"
+
+REMOTE_HEAD=$(git rev-parse 'origin/main' 2>/dev/null || true)
 [ "$REMOTE_HEAD" = "$TAG_HEAD" ] || fail "origin/main ($REMOTE_HEAD) and $TAG ($TAG_HEAD) disagree"
 
 PUBLISHED_HEAD=$(npm view "dsh-agy-mode@$VERSION" gitHead --registry "$REGISTRY" 2>/dev/null | tr -d "'\"")

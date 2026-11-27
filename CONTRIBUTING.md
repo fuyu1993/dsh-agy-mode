@@ -116,6 +116,14 @@ cannot recur.
   bare token yields `EOTP`.
 - 已发布的版本不可覆盖，必须先改 `package.json` 的 `version`。
   A published version cannot be overwritten; bump `package.json` `version` first.
+- tag 名必须与它所指提交的 `package.json` 版本一致。手工打 tag 时最容易犯的错是
+  改了代码、忘了提版本就直接 `git tag -a vX.Y.Z`，于是该 tag 指向的提交仍声明旧
+  版本。脚本在发布前和校验阶段各查一次，不一致即拒绝。
+  A tag's name must match the `package.json` version of the commit it points at.
+  The easy manual mistake is to change code, forget to bump the version, and run
+  `git tag -a vX.Y.Z` anyway, leaving a tag whose commit still declares the old
+  version. The script checks this before publishing and again while verifying, and
+  refuses on a mismatch.
 - `gh` 与 npm 都必须先登录：脚本在推送 main 之前就检查，避免推了 main 和 tag 才
   失败，留下一个本地 tag 挡住直接重跑。
   Both `gh` and npm must be authenticated; the script checks before pushing main,
