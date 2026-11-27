@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1094,4 +1094,121 @@ test('the configuration row supplies a reader even when the caller passes none',
   const reader = services.get(DEFAULTS_SERVICE)
   assert.equal(typeof reader, 'function', 'a missing reader must not register undefined')
   assert.deepEqual(reader('plan'), { present: true, model: 'only-model', effort: 'medium' })
+})
+
+test('collectDiff skips an untracked symlink instead of quoting its target', async () => {
+  // An untracked `leak -> <outside file>` passes a path-prefix check, and both
+  // `stat` and `readFile` follow it. Before lstat, the target's bytes were
+  // quoted into the diff and sent to agy.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-link-'))
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-agy-secret-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'base.js'), 'export const base = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const secret = join(outside, 'credentials')
+    writeFileSync(secret, 'AWS_SECRET_ACCESS_KEY=should-never-be-quoted\n')
+    symlinkSync(secret, join(dir, 'leak'))
+
+    let lastPrompt = ''
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    const { ctx, callTool } = makeMockCtx({
+      spawnHandler: withRealGit((opts) => {
+        lastPrompt = opts.argv[opts.argv.indexOf('--print') + 1]
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS',
+            conversation_id: 'conv-link',
+            num_turns: 1,
+            response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }
+      }),
+    })
+    apply(ctx)
+
+    await callTool('edit', { path: 'base.js' }, root.agent)
+    writeFileSync(join(dir, 'base.js'), 'export const base = 2\n')
+    await callTool('agy_review', {}, root.agent)
+
+    // The secret must not appear, and the skip must be visible rather than silent.
+    assert.doesNotMatch(lastPrompt, /AWS_SECRET_ACCESS_KEY/)
+    assert.match(lastPrompt, /leak \(symlink\)/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('a read-only shell call during a review does not invalidate the pass', async () => {
+  // The gate samples a fingerprint only while the task is clean. The old code
+  // still paid for a fingerprint after the call and discarded the answer, then
+  // fell through to `markDirty`, which bumps the epoch. A `git status` landing
+  // while agy_review is in flight therefore made its pass look stale, and the
+  // task was steered back to re-review work that had already been approved.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-agy-epoch-'))
+  try {
+    execFileSync('git', ['init'], { cwd: dir })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+    writeFileSync(join(dir, 'base.js'), 'export const base = 1\n')
+    execFileSync('git', ['add', '.'], { cwd: dir })
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: dir })
+
+    const root = makeAgent({ id: 'root-1', depth: 0, cwd: dir })
+    let releaseReview
+    const reviewGate = new Promise(resolve => { releaseReview = resolve })
+    let reviewStarted
+    const reviewStart = new Promise(resolve => { reviewStarted = resolve })
+
+    const { ctx, callTool, stopTurn } = makeMockCtx({
+      spawnHandler: withRealGit((opts) => {
+        // Only the review is held open; `git` keeps running normally.
+        if (!opts.argv.includes('--json-schema')) {
+          return { exitCode: 0, stdout: 'ok', stderr: '' }
+        }
+        reviewStarted()
+        // `spawn` awaits whatever the handler returns, so the review can be held
+        // open while another tool call runs.
+        return reviewGate.then(() => ({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            status: 'SUCCESS',
+            conversation_id: 'conv-r',
+            num_turns: 1,
+            response: '',
+            structured_output: { verdict: 'pass', summary: 'ok', findings: [] },
+          }),
+          stderr: '',
+        }))
+      }),
+    })
+    apply(ctx)
+
+    // Make the task dirty, then review it.
+    await callTool('edit', { path: 'base.js' }, root.agent)
+    writeFileSync(join(dir, 'base.js'), 'export const base = 2\n')
+
+    const reviewPromise = callTool('agy_review', {}, root.agent)
+    await reviewStart
+    // A read-only command arrives while the review is in flight.
+    await callTool('bash', { command: 'git status --porcelain' }, root.agent)
+    releaseReview()
+
+    const res = await reviewPromise
+    assert.equal(res.value.verdict, 'pass')
+
+    // The pass must stand: closing the turn must not steer the agent back.
+    await stopTurn(root.agent, 1)
+    assert.deepEqual(root.steered, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

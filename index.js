@@ -30,7 +30,7 @@
 
 import { homedir, tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { lstat, readFile, realpath, stat, unlink } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export const name = 'agy-planner'
@@ -359,6 +359,21 @@ async function collectUntrackedDiffs(cwd, untracked, budgetUnits, measure = prom
       omitted.push(relPath)
       continue
     }
+    // `resolve` alone does not settle containment: a symlink inside the
+    // repository can point anywhere, and both `stat` and `readFile` follow it.
+    // An untracked `leak -> ~/.npmrc` would otherwise pass the path check and
+    // have its target's bytes quoted into the diff sent to agy. `lstat` sees the
+    // link itself, so a symlink is skipped rather than resolved.
+    try {
+      const link = await lstat(absPath)
+      if (link.isSymbolicLink()) {
+        omitted.push(`${relPath} (symlink)`)
+        continue
+      }
+    } catch {
+      omitted.push(relPath)
+      continue
+    }
     if (remaining < 200) {
       omitted.push(relPath)
       continue
@@ -372,6 +387,13 @@ async function collectUntrackedDiffs(cwd, untracked, budgetUnits, measure = prom
         continue
       }
       buf = await readFile(absPath)
+      // The link could have been swapped in between the `lstat` and the read.
+      // Cheap to re-check, and the failure it prevents is a secret in the prompt.
+      const real = await realpath(absPath)
+      if (real !== absPath) {
+        omitted.push(`${relPath} (symlink)`)
+        continue
+      }
     } catch {
       omitted.push(relPath)
       continue
@@ -964,10 +986,23 @@ export function apply(ctx, config = {}) {
       // git repository, git missing) is not evidence of a change, and treating
       // it as one would demand a review of work that never happened.
       if (isShell) {
-        const after = await repoFingerprint(reviewCwd, execution.signal)
-        // Unchanged repository: a read-only command. Recording it would force a
-        // review of a diff that does not exist, and would re-arm a stalled loop.
-        if (before !== undefined && after !== undefined && after === before) return result
+        // Only a sampled call can be judged by its effect. `before` is absent
+        // when the gate was already dirty at entry, when there is no agent (a
+        // subagent has its own root), or when cwd could not be resolved. Reading
+        // the fingerprint anyway cost three git invocations plus up to 200
+        // `stat`s and then discarded the answer, and — worse — a read-only
+        // command would still fall through to `markDirty`, bumping the epoch and
+        // invalidating a `pass` that was in flight at that moment.
+        if (before !== undefined) {
+          const after = await repoFingerprint(reviewCwd, execution.signal)
+          // Unchanged repository: a read-only command. Recording it would force
+          // a review of a diff that does not exist, and would re-arm a stalled loop.
+          if (after !== undefined && after === before) return result
+        } else if (gate.dirtyCwds.has(reviewCwd)) {
+          // The directory is already dirty, so this call cannot make the gate
+          // stricter than it is. Recording it would only move the epoch.
+          return result
+        }
       }
       markDirty(gate, reviewCwd, FILE_MUTATING_TOOLS.has(execution.name) ? 'edit' : 'shell')
       // Once real work happens after hitting the round cap, re-arm the gate.

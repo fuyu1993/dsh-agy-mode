@@ -10,10 +10,34 @@ Run `npm test` (or `node --test`) to execute `test/index.test.js`, which verifie
 - Pure helpers: `reconcileEffort`, `resolveVerdict` (including empty `fail` locking the gate), `parsePorcelainStatus`, `prioritizeAndClipDiff` (source files prioritized ahead of lockfiles), `renderReview`, `authHint`, `transientHint`, `summarise`, `boundedSet`, `promptUnits`, `clipToUnits` (byte budget without splitting a character), and `isUntrackedNoise`.
 - Delegation guard across all budget branches and `agy_routes` inheritance across child sessions and tiers.
 - Review gate across root and subagent edits, empty-`fail` locking, `stalled` re-arming on new edits, and shell-only fingerprint verification against real temporary git repositories.
-- `collectDiff` inclusion of untracked text files, binary skipping, and `baseHead..HEAD` mid-task commit diffs.
+- `collectDiff` inclusion of untracked text files, binary skipping, symlink skipping, and `baseHead..HEAD` mid-task commit diffs.
 - `runAgy` per-root serialization, stale conversation recovery, transient retries, and `agy_models` auth hints.
+- A read-only shell call during an in-flight review leaving the pass valid.
 
-27 tests in total as of 0.4.2.
+29 tests in total as of 0.4.5.
+
+### 0.4.5
+
+Two defects found by an audit, both reachable in ordinary use.
+
+- **An untracked symlink leaked its target into the prompt.** `collectUntrackedDiffs`
+  checked that `resolve(root, relPath)` stayed under the repository, then called
+  `stat` and `readFile` — both of which follow links. An untracked
+  `leak -> ~/.npmrc` passed the path check and had the target's bytes quoted
+  into the diff sent to agy. It now `lstat`s first and skips a symlink, and
+  re-checks with `realpath` after reading in case the link was swapped in
+  between. The skip is reported as `<path> (symlink)`, like every other omission.
+- **A read-only command during a review invalidated the pass.** The gate samples
+  a repository fingerprint only while the task is clean. The code still computed
+  one after a shell call on an already-dirty task, discarded the answer, and fell
+  through to `markDirty`, which bumps the epoch — so a `git status` arriving
+  while `agy_review` was in flight made its verdict look stale and the task was
+  steered back to re-review approved work. It also paid three git invocations
+  plus up to 200 `stat`s for an answer it threw away. Both are fixed by only
+  judging a call whose effect was actually sampled.
+
+Both are covered by a test that fails when the fix is reverted to the 0.4.4
+behaviour (verified by reverting each in turn: `not ok 28` and `not ok 29`).
 
 ### 0.4.1
 
