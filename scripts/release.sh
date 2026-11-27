@@ -13,7 +13,12 @@
 #
 # 用法 / Usage:
 #   scripts/release.sh --notes FILE    # 用指定文件作为 Release 正文（必填）
-#   scripts/release.sh --notes FILE --dry-run   # 只检查，不发布
+#   scripts/release.sh --notes FILE --title TEXT   # 指定 Release 标题
+#   scripts/release.sh --notes FILE --dry-run      # 只检查，不发布
+#
+# 标题缺省为 tag 名；建议用双语形式，与 CONTRIBUTING.md 的约定一致。
+# The title defaults to the tag name; the bilingual form CONTRIBUTING.md shows is
+# preferred when you pass one.
 #
 # 前置 / Requires: clean tree, gh authenticated, npm authenticated for
 # registry.npmjs.org, and the version not yet published.
@@ -25,6 +30,7 @@ cd "$(dirname "$0")/.."
 REGISTRY='https://registry.npmjs.org/'
 DRY_RUN=0
 NOTES=''
+TITLE=''
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,7 +38,10 @@ while [ $# -gt 0 ]; do
     --notes)
       [ $# -ge 2 ] || { echo 'release: --notes needs a file' >&2; exit 2; }
       NOTES="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --title)
+      [ $# -ge 2 ] || { echo 'release: --title needs text' >&2; exit 2; }
+      TITLE="$2"; shift 2 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "release: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -66,6 +75,22 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 # tag 若已存在，说明这个版本已经打过，不能静默覆盖。
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   fail "tag $TAG already exists locally"
+fi
+
+# 认证先于推送：gh 或 npm 未登录时，早失败好过推了 main 和 tag 才发现，那会留下
+# 一个本地 tag 挡住直接重跑。
+# Auth before pushing: an unauthenticated gh or npm fails better here than after
+# main and the tag are public, which would leave a local tag blocking a re-run.
+step 'auth'
+gh auth status >/dev/null 2>&1 || fail 'gh is not authenticated'
+npm whoami --registry "$REGISTRY" >/dev/null 2>&1 \
+  || fail "not authenticated for $REGISTRY (the default registry in ~/.npmrc is a mirror)"
+
+# 远端 tag 同名也算冲突：覆盖已发布的 tag 会让别人拉到与本地不同的提交。
+# A remote tag of the same name is a conflict too: overwriting a published tag
+# makes others fetch a different commit than the local one.
+if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+  fail "tag $TAG already exists on origin"
 fi
 
 step 'tests'
@@ -110,8 +135,9 @@ git push origin "$TAG"
 
 # --- 3. 建 Release / GitHub Release -----------------------------------------
 
-step "create release $TAG"
-gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" --verify-tag
+[ -n "$TITLE" ] || TITLE="$TAG"
+step "create release $TAG ($TITLE)"
+gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES" --verify-tag
 
 # --- 4. 发布到 npm / publish -----------------------------------------------
 

@@ -54,8 +54,9 @@ npm publish. All three complete before a version counts as released.**
 The order is fixed; run the script instead of typing the steps by hand:
 
 ```bash
-npm run release:check      # 只检查：版本未占用、树干净、测试通过、打包正常
-npm run release            # 真正发布：推送 → tag → Release → npm → 一致性校验
+# --notes 必填，两种模式都要；--title 缺省为 tag 名
+npm run release:check -- --notes notes.md   # 只检查：认证、版本未占用、树干净、测试通过、打包正常
+npm run release       -- --notes notes.md   # 真正发布：推送 → tag → Release → npm → 一致性校验
 ```
 
 手工等价于 / Equivalently, by hand:
@@ -65,6 +66,7 @@ git push origin main
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 gh release create vX.Y.Z --title "vX.Y.Z — <中文> / <English>" --notes-file notes.md --verify-tag
+# 脚本等价：scripts/release.sh --notes notes.md --title "vX.Y.Z — <中文> / <English>"
 npm publish --access public --registry https://registry.npmjs.org/
 ```
 
@@ -98,6 +100,10 @@ cannot recur.
   default.
 - 已发布的版本不可覆盖，必须先改 `package.json` 的 `version`。
   A published version cannot be overwritten; bump `package.json` `version` first.
+- `gh` 与 npm 都必须先登录：脚本在推送 main 之前就检查，避免推了 main 和 tag 才
+  失败，留下一个本地 tag 挡住直接重跑。
+  Both `gh` and npm must be authenticated; the script checks before pushing main,
+  so a failure cannot leave main and a tag public while blocking a re-run.
 - 发布沙箱/暂存（staged publishing）开启时，`npm publish` 后需到 npm 网页批准才会
   真正上线；脚本只在 `gitHead` 可读时通过校验。
   With staged publishing on, `npm publish` needs approval on the npm website

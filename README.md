@@ -211,6 +211,6 @@ Releases go through one script that fixes push, tag, Release, npm and the
 same-commit check into a single transaction:
 
 ```bash
-npm run release:check      # 只检查，不发布
-npm run release            # 发布
+npm run release:check -- --notes notes.md   # 只检查，不发布
+npm run release       -- --notes notes.md   # 发布
 ```
