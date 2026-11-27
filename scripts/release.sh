@@ -55,6 +55,16 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\033[31mrelease: %s\033[0m\n' "$*" >&2; exit 1; }
 step() { say "→ $*"; }
 
+# 读某个提交里 package.json 声明的版本；读不到时输出空串，交给调用方判断。
+# 两处一致性地校验都用它，避免把同一段 JSON 解析写两遍。
+# The version a commit's package.json declares, or empty when it cannot be read;
+# the caller decides what that means. Both consistency checks share it so the JSON
+# parsing is written once.
+commit_version() {
+  git show "$1:package.json" 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version))}catch{process.stdout.write("")}})'
+}
+
 # --- 版本 / version ---------------------------------------------------------
 
 VERSION=$(node -p "require('./package.json').version")
@@ -78,7 +88,7 @@ step "version $VERSION (tag $TAG)"
 # disagrees with its own name. Both 0.4.7 and 0.4.8 were tagged that way once.
 # The script derives the tag from `package.json`, so what this adds is the check
 # that the commit about to be tagged is HEAD and declares the released version.
-HEAD_VERSION=$(git show 'HEAD:package.json' 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version))}catch{process.stdout.write("")}})')
+HEAD_VERSION=$(commit_version HEAD)
 [ "$HEAD_VERSION" = "$VERSION" ] \
   || fail "the version in HEAD's package.json ($HEAD_VERSION) does not match $VERSION; commit the bump before tagging"
 
@@ -200,7 +210,7 @@ TAG_HEAD=$(git rev-parse "$TAG^{commit}")
 # 因为中途可能有别的提交混进来。
 # The tag must point at a commit that declares the version. This re-checks after
 # the pushes, since something could have landed in between.
-TAGGED_VERSION=$(git show "$TAG_HEAD:package.json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version))}catch{process.stdout.write("")}})')
+TAGGED_VERSION=$(commit_version "$TAG_HEAD")
 [ "$TAGGED_VERSION" = "$VERSION" ] \
   || fail "tag $TAG points at a commit whose package.json declares $TAGGED_VERSION, not $VERSION"
 
