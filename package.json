@@ -28,7 +28,9 @@
   "main": "./config.js",
   "scripts": {
     "test": "node --test",
-    "prepublishOnly": "node --test"
+    "prepublishOnly": "node --test",
+    "release": "scripts/release.sh",
+    "release:check": "scripts/release.sh --dry-run"
   },
   "exports": {
     ".": "./config.js",
@@ -42,6 +44,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "scripts",
     "README.md",
     "LICENSE",
     "index.js",

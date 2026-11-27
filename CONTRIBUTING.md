@@ -44,6 +44,65 @@ gh release create vX.Y.Z --title "vX.Y.Z — <中文> / <English>" --notes-file 
   Each release gets one annotated tag `vX.Y.Z`, pointing at the last commit whose
   `package.json` declares that version
 
+## 发布流程 / Release procedure
+
+**规则：提交推送到 git 之后，必须接着打 tag、建 Release、发布到 npm，三步做完才算发布。**
+**Rule: once a commit is pushed, it is followed by a tag, a GitHub Release and an
+npm publish. All three complete before a version counts as released.**
+
+顺序固定，用脚本执行，不要手工逐步敲：
+The order is fixed; run the script instead of typing the steps by hand:
+
+```bash
+npm run release:check      # 只检查：版本未占用、树干净、测试通过、打包正常
+npm run release            # 真正发布：推送 → tag → Release → npm → 一致性校验
+```
+
+手工等价于 / Equivalently, by hand:
+
+```bash
+git push origin main
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+gh release create vX.Y.Z --title "vX.Y.Z — <中文> / <English>" --notes-file notes.md --verify-tag
+npm publish --access public --registry https://registry.npmjs.org/
+```
+
+### 为什么四步必须一起 / Why all four
+
+- **tag** 让一个版本号锚定到一个确切提交，没有它 `vX.Y.Z` 只是巧合。
+  A tag anchors a version number to one commit; without it `vX.Y.Z` is a coincidence.
+- **Release** 是给人读的改动说明与升级入口。
+  The Release is the human-readable changelog and upgrade entry point.
+- **npm** 是安装来源。DSH 插件页的「版本」栏只对 registry 安装渲染，只在 GitHub
+  发布的话用户装到的版本与页面显示的对不上。
+  npm is the install source. The DSH plugin page renders its version column only
+  for registry installs, so a GitHub-only release leaves what users install out
+  of step with what the page shows.
+
+脚本最后会核对三者：`origin/main`、`vX.Y.Z` 的提交、npm 记录的 `gitHead` 必须
+是同一个提交，否则报错退出。历史上 0.4.4 就出现过 npm 已发、main 未推、无 tag
+的错位，这个校验是为了不再出现。
+
+The script ends by checking that `origin/main`, the tag's commit and the `gitHead`
+npm recorded are one commit, and fails otherwise. 0.4.4 once shipped to npm while
+main lagged two commits behind and no tag existed; this check exists so that
+cannot recur.
+
+### 前置条件 / Preconditions
+
+- npm 认证只对 `registry.npmjs.org` 有效：本机 `~/.npmrc` 默认指向镜像，所以脚本
+  **显式**传 `--registry`，不要依赖默认值。
+  npm auth is only valid for `registry.npmjs.org`; the local `~/.npmrc` defaults to
+  a mirror, so the script passes `--registry` explicitly rather than trusting the
+  default.
+- 已发布的版本不可覆盖，必须先改 `package.json` 的 `version`。
+  A published version cannot be overwritten; bump `package.json` `version` first.
+- 发布沙箱/暂存（staged publishing）开启时，`npm publish` 后需到 npm 网页批准才会
+  真正上线；脚本只在 `gitHead` 可读时通过校验。
+  With staged publishing on, `npm publish` needs approval on the npm website
+  before the version is live; the script only passes once `gitHead` is readable.
+
 ## 合并前 / Before merging
 
 ```bash

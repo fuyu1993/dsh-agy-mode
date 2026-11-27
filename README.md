@@ -205,3 +205,12 @@ MIT，见 [LICENSE](LICENSE)。
 Commit messages and release notes are **bilingual** (Chinese and English); see
 [CONTRIBUTING.md](CONTRIBUTING.md), and `git config commit.template .gitmessage`
 to enable the template.
+
+发布一律走脚本，它把「推送 → 打 tag → 建 Release → 发布 npm → 校验四处同一提交」固定成一个事务：
+Releases go through one script that fixes push, tag, Release, npm and the
+same-commit check into a single transaction:
+
+```bash
+npm run release:check      # 只检查，不发布
+npm run release            # 发布
+```
