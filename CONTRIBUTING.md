@@ -108,10 +108,12 @@ cannot recur.
 
 - npm 认证只对 `registry.npmjs.org` 有效：本机 `~/.npmrc` 默认指向镜像，所以脚本
   **显式**传 `--registry`，不要依赖默认值。
-- 2FA 账号必须提供 `--otp`，或改用 registry 的浏览器授权；只给 token 会得到 `EOTP`。
   npm auth is only valid for `registry.npmjs.org`; the local `~/.npmrc` defaults to
   a mirror, so the script passes `--registry` explicitly rather than trusting the
   default.
+- 2FA 账号必须提供 `--otp`，或改用 registry 的浏览器授权；只给 token 会得到 `EOTP`。
+  A 2FA account must provide `--otp` or use the registry's browser authorisation; a
+  bare token yields `EOTP`.
 - 已发布的版本不可覆盖，必须先改 `package.json` 的 `version`。
   A published version cannot be overwritten; bump `package.json` `version` first.
 - `gh` 与 npm 都必须先登录：脚本在推送 main 之前就检查，避免推了 main 和 tag 才
