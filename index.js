@@ -386,14 +386,16 @@ async function collectUntrackedDiffs(cwd, untracked, budgetUnits, measure = prom
         omitted.push(`${relPath} (${info.size} bytes)`)
         continue
       }
-      buf = await readFile(absPath)
-      // The link could have been swapped in between the `lstat` and the read.
-      // Cheap to re-check, and the failure it prevents is a secret in the prompt.
+      // Re-check containment immediately before the read: the `lstat` above
+      // already rejected a link, but the path could have been swapped for one
+      // since. Checking after `readFile` would have read the target first and
+      // then discarded it, which is the wrong order for the thing being avoided.
       const real = await realpath(absPath)
       if (real !== absPath) {
         omitted.push(`${relPath} (symlink)`)
         continue
       }
+      buf = await readFile(absPath)
     } catch {
       omitted.push(relPath)
       continue
@@ -1009,12 +1011,10 @@ export function apply(ctx, config = {}) {
       // it as one would demand a review of work that never happened.
       if (isShell) {
         // Only a sampled call can be judged by its effect. `before` is absent
-        // when the gate was already dirty at entry, when there is no agent (a
-        // subagent has its own root), or when cwd could not be resolved. Reading
-        // the fingerprint anyway cost three git invocations plus up to 200
-        // `stat`s and then discarded the answer, and — worse — a read-only
-        // command would still fall through to `markDirty`, bumping the epoch and
-        // invalidating a `pass` that was in flight at that moment.
+        // when the directory was already dirty and no review was in flight at
+        // entry, when there is no agent (a subagent has its own root), or when
+        // cwd could not be resolved. Those are the calls whose edit a concurrent
+        // review cannot be watching, so recording them unconditionally is safe.
         if (before !== undefined) {
           const after = await repoFingerprint(reviewCwd, execution.signal)
           // Unchanged repository: a read-only command. Recording it would force

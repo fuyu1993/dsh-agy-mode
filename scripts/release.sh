@@ -126,38 +126,51 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-# --- 1. 推送 / push ---------------------------------------------------------
+# --- 1. 发布到 npm / publish -----------------------------------------------
+
+# npm 排在最前，而不是最后。一次性验证码只有约 30 秒有效期，若先推 main、打 tag、
+# 建 Release 再发布，验证码往往已过期，于是又留下「GitHub 已发、npm 没有」的半成品
+# ——正是本脚本要避免的状态。npm 也拒绝重复版本，所以它是最安全的第一道闸门：
+# 它成功即证明这个版本号未被占用，后面的步骤都可以安全重跑。
+#
+# npm comes first, not last. A one-time password lives about 30 seconds, so
+# pushing main, tagging and creating the Release before publishing usually lets
+# it expire — leaving exactly the "GitHub ahead of npm" state this script exists
+# to prevent. npm also refuses a duplicate version, which makes it the safest
+# first gate: its success proves the version number is free, and every later step
+# is safely re-runnable.
+# 显式指定 registry：本机 ~/.npmrc 默认指向镜像，认证只对 npmjs 有效。
+step "publish to $REGISTRY"
+
+# prepublishOnly 会再跑一遍测试，而测试刚刚跑过。跳过它省掉几十秒，也缩小验证码
+# 过期窗口；真正把关的是上面那次 npm test。
+# prepublishOnly would re-run the tests that just ran. Skipping it saves the tens
+# of seconds that matter for a 30-second code; the real gate is the run above.
+if [ -n "$OTP" ]; then
+  npm publish --access public --registry "$REGISTRY" --otp "$OTP" --ignore-scripts \
+    || fail "npm publish failed. Nothing was pushed yet, so this is safe to retry: scripts/release.sh --notes $NOTES --otp <new code>"
+else
+  npm publish --access public --registry "$REGISTRY" --ignore-scripts \
+    || fail "npm publish failed (a 2FA account needs --otp CODE). Nothing was pushed yet, so this is safe to retry: scripts/release.sh --notes $NOTES --otp <code>"
+fi
+
+# --- 2. 推送 / push ---------------------------------------------------------
 
 step 'push main'
 git push origin main
 
-# --- 2. 打 tag / tag --------------------------------------------------------
+# --- 3. 打 tag / tag --------------------------------------------------------
 
 # annotated，而不是轻量 tag：它记录发布者与时间，且指向确切的提交。
 git tag -a "$TAG" -m "$TAG" -m "由 scripts/release.sh 发布 / released by scripts/release.sh"
 step "push $TAG"
 git push origin "$TAG"
 
-# --- 3. 建 Release / GitHub Release -----------------------------------------
+# --- 4. 建 Release / GitHub Release -----------------------------------------
 
 [ -n "$TITLE" ] || TITLE="$TAG"
 step "create release $TAG ($TITLE)"
 gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES" --verify-tag
-
-# --- 4. 发布到 npm / publish -----------------------------------------------
-
-# 显式指定 registry：本机 ~/.npmrc 默认指向镜像，认证只对 npmjs 有效。
-step "publish to $REGISTRY"
-# 2FA 账号需要一次性验证码；没有它 npm 会在推完 main、tag 与 Release 之后才报
-# EOTP，留下脚本本想避免的半发布状态。
-# A 2FA account needs a one-time password; without it npm fails with EOTP only
-# after main, the tag and the Release are already out — the half-published state
-# this script exists to prevent.
-if [ -n "$OTP" ]; then
-  npm publish --access public --registry "$REGISTRY" --otp "$OTP"
-else
-  npm publish --access public --registry "$REGISTRY"
-fi
 
 # --- 5. 一致性校验 / verify -------------------------------------------------
 
