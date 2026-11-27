@@ -206,9 +206,11 @@ Commit messages and release notes are **bilingual** (Chinese and English); see
 [CONTRIBUTING.md](CONTRIBUTING.md), and `git config commit.template .gitmessage`
 to enable the template.
 
-发布一律走脚本，它把「推送 → 打 tag → 建 Release → 发布 npm → 校验四处同一提交」固定成一个事务：
-Releases go through one script that fixes push, tag, Release, npm and the
-same-commit check into a single transaction:
+发布一律走脚本，它把「发布 npm → 推送 → 打 tag → 建 Release → 校验四处同一提交」固定成一个事务。npm 排第一，因为 2FA 验证码只有约 30 秒有效期，且 npm 拒绝重复版本，是最安全的首道闸门：
+Releases go through one script that fixes npm publish, push, tag, Release and the
+same-commit check into a single transaction. npm runs first: a 2FA code lives
+about 30 seconds, and npm refuses duplicate versions, which makes it the safest
+first gate:
 
 ```bash
 npm run release:check -- --notes notes.md   # 只检查，不发布

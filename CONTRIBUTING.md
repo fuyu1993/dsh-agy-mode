@@ -56,19 +56,32 @@ The order is fixed; run the script instead of typing the steps by hand:
 ```bash
 # --notes 必填，两种模式都要；--title 缺省为 tag 名
 npm run release:check -- --notes notes.md   # 只检查：认证、版本未占用、树干净、测试通过、打包正常
-npm run release       -- --notes notes.md   # 真正发布：推送 → tag → Release → npm → 一致性校验
+npm run release       -- --notes notes.md   # 真正发布：npm → 推送 → tag → Release → 一致性校验
 ```
 
 手工等价于 / Equivalently, by hand:
 
 ```bash
+# 1. npm 先发：它拒绝重复版本，是最安全的第一道闸门，也避免验证码在推送后过期
+npm publish --access public --registry https://registry.npmjs.org/ --otp <code>
+# 2-4. 其余三步
 git push origin main
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 gh release create vX.Y.Z --title "vX.Y.Z — <中文> / <English>" --notes-file notes.md --verify-tag
-# 脚本等价：scripts/release.sh --notes notes.md --title "vX.Y.Z — <中文> / <English>"
-npm publish --access public --registry https://registry.npmjs.org/
 ```
+
+**npm 为什么排第一**：一次性验证码（2FA）只有约 30 秒有效期。若先推 main、打 tag、
+建 Release 再发布，验证码往往已过期，于是留下「GitHub 已发、npm 没有」的半成品——
+正是这套流程要避免的状态。`npm publish` 拒绝重复版本，成功即证明版本号未被占用，
+后续步骤失败都可安全重跑。2FA 账号请用 `--otp <code>`，或走 registry 的浏览器授权。
+
+**Why npm goes first**: a 2FA one-time password lives about 30 seconds. Pushing
+main, tagging and creating the Release before publishing usually lets it expire,
+leaving GitHub ahead of npm — exactly the state this procedure exists to prevent.
+`npm publish` refuses a duplicate version, so its success proves the version
+number is free and any later step can be safely retried. A 2FA account should pass
+`--otp <code>`, or use the registry's browser authorisation.
 
 ### 为什么四步必须一起 / Why all four
 
@@ -95,6 +108,7 @@ cannot recur.
 
 - npm 认证只对 `registry.npmjs.org` 有效：本机 `~/.npmrc` 默认指向镜像，所以脚本
   **显式**传 `--registry`，不要依赖默认值。
+- 2FA 账号必须提供 `--otp`，或改用 registry 的浏览器授权；只给 token 会得到 `EOTP`。
   npm auth is only valid for `registry.npmjs.org`; the local `~/.npmrc` defaults to
   a mirror, so the script passes `--registry` explicitly rather than trusting the
   default.
